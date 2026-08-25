@@ -1,0 +1,4 @@
+2026-08-24 21:12:41,866 p2pmoe.agent INFO agent n11 已启动，监听 127.0.0.1:35623；可用内存 26MB，基准 99.533ms/单位；模拟接入段 28±7ms
+2026-08-24 21:12:41,867 p2pmoe.agent INFO 等待控制器下发清单…（未配置态只响应 capabilities / echo / probe）
+2026-08-24 21:12:49,051 p2pmoe.agent INFO 收到停止信号，退出
+2026-08-24 21:12:49,134 p2pmoe.agent INFO agent n11 已停止（累计处理 30 条消息）

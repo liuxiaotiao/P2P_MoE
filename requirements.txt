@@ -1,0 +1,35 @@
+# 运行时依赖 —— 每台节点只需要这些
+#
+#     pip3 install -r requirements.txt
+#
+# 就一个。这不是巧合：规划器是纯 numpy 的（不 import torch，也不知道 MoE 是什么），
+# 通信层用标准库 socket，toy 模型的前向也是 numpy 写的。整个框架跑起来不需要
+# 任何深度学习框架 —— 这让「把代码 rsync 到 15 台机器上」这件事足够便宜。
+#
+# ---------------------------------------------------------------------------
+# 接真实 MoE 模型之后会多出哪些？（TODO.md 的 P0，现在装了也没用）
+#
+#   torch          必须。张量与 GPU kernel。
+#   safetensors    必须，而且是**最关键的一个**：整套方案的前提是「每层只装
+#                  n_{u,l} 个专家」，safetensors 的逐张量 mmap 让我们能只打开
+#                  `...layers.20.mlp.experts.7.w1.weight` 这些 key。用 pickle
+#                  格式的 .bin 权重做不到这件事。
+#   transformers   大概率要。不是为了它的模型前向（MoE block 我们要自己写，
+#                  因为 fused kernel 拿不到 routing、也不支持专家子集），而是
+#                  为了 tokenizer、config 解析、以及 attention/RoPE/norm 这些
+#                  逐模型的琐碎实现 —— 自己重写这些没有价值。
+#
+#   accelerate     **大概率不需要。** 它的两个主要用途在这套架构里都不适用：
+#                  · device_map="auto" 自动分层到设备 —— 那正是我们要替换掉的
+#                    东西。放置由规划器决定，写在 NodePlan 里；让 accelerate 再
+#                    自动分一次只会打架。
+#                  · load_checkpoint_and_dispatch 整模块加载 —— 它不认识
+#                    「只加载第 20 层的 3、7、12 号专家」，我们要的是逐 key 过滤。
+#                  唯一可能用得上的是 init_empty_weights（meta 设备建骨架，再
+#                  只 materialize 需要的张量）。但那也可以用 torch 的 meta device
+#                  直接做。落地时再决定，不预先写进依赖。
+#
+# 而且这些**只有跑推理的节点**需要 —— 控制机（跑规划、探测、下发）仍然只要 numpy。
+# 到时候应该拆成 requirements.txt（控制机）+ requirements-node.txt（推理节点）。
+
+numpy>=1.24        # 已在 numpy 2.x 上验证（开发用 2.4.4，实测机 2.2.6）

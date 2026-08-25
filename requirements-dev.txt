@@ -1,0 +1,11 @@
+# 开发/测试依赖
+#
+#     pip3 install -r requirements-dev.txt
+#     python3 -m pytest -q tests/
+#
+# 节点上**不需要**装这些 —— 真机部署只要 requirements.txt。
+
+-r requirements-node.txt   # 测试会覆盖真实模型执行层，所以要 torch/safetensors
+
+pytest>=7          # 部分用例会起真实子进程（标了 slow）；
+                   # 真实模型层的用例在没装 torch 时会自动跳过
