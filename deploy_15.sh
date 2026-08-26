@@ -4,6 +4,7 @@
 #
 #   ./deploy_15.sh sync       # 有 ssh：推代码 + 装依赖到 15 台
 #   ./deploy_15.sh bootstrap  # 没 ssh：起个 HTTP 服务，打印每台该跑的一条命令
+#   ./deploy_15.sh cmds       # 逐台打印它自己该跑的命令（层区间/拉取量各不同）
 #   ./deploy_15.sh check      # 只检查连通性与依赖，不动任何东西
 #   ./deploy_15.sh fetch      # 各节点只拉自己那份权重（合计 141GB，不是 2400GB）
 #   ./deploy_15.sh start      # 起 agent
@@ -66,6 +67,7 @@ cmd_bootstrap() {
   echo "  代码包 $(du -h "$tmp/p2pmoe.tar.gz" | cut -f1)，清单 $(du -h "$tmp/plan.json" | cut -f1)"
   echo
   echo "  ── 在**每台节点**上跑这一条（把 <ID> 换成该机的节点 id）─────────────"
+  echo "  ── 每台各自的层区间与拉取量不同，逐台展开见：./deploy_15.sh cmds ──"
   cat <<EOS
 
   ID=<ID>   # N01 … N15
@@ -87,6 +89,70 @@ EOS
   echo
   echo "  HTTP 服务在 $ip:$port —— **Ctrl-C 结束**（等 15 台都拉完再关）"
   cd "$tmp" && exec $PY -m http.server "$port"
+}
+
+# 打印每台节点各自要跑的命令。每台干的事不一样 —— 层区间、拉多少权重、
+# 在段里排第几 —— 所以这里按清单逐台展开，而不是给一条通用命令让人自己填。
+#
+#   ./deploy_15.sh cmds        # 15 台全打出来
+#   ./deploy_15.sh cmds N07    # 只看某一台
+cmd_cmds() {
+  need "$PLAN"; need "$HOSTS"
+  local only=${1:-}
+  local port=${BOOT_PORT:-9300}
+  local ip=${ADVERTISE:-<控制机IP>}
+  $PY - "$PLAN" "$HOSTS" "$only" "$ip" "$port" "$WORKDIR" "$WEIGHTS" "$REPO" "$PY" <<'PYEOF'
+import json, sys
+plan, hostsf, only, ip, port, workdir, weights, repo, py = sys.argv[1:10]
+m = json.load(open(plan))
+
+addr = {}
+for line in open(hostsf, encoding="utf-8"):
+    line = line.split("#")[0].split()
+    if len(line) >= 2:
+        addr[line[0]] = line[1]
+
+where = {}
+for sid, sg in m["segments"].items():
+    for i, n in enumerate(sg["nodes"]):
+        where[n] = (sid, i, len(sg["nodes"]), sg["role"], sg.get("task"))
+
+B, R, D = "\033[1m", "\033[0m", "\033[2m"
+nodes = sorted(m["nodes"], key=lambda x: x["node"])
+if only:
+    nodes = [n for n in nodes if n["node"] == only]
+    if not nodes:
+        print(f"清单里没有 {only}"); raise SystemExit(1)
+
+for n in nodes:
+    nid = n["node"]
+    sid, i, tot, role, task = where[nid]
+    lr = n.get("layer_range")
+    pos = f"{i+1}/{tot}"
+    tag = " ← 段首（接收请求）" if n.get("is_head") else \
+          " ← 段尾（出 token / 交给后段）" if n.get("is_tail") else ""
+    print(f"\n{B}┌─ {nid}  {addr.get(nid,'?')}{R}")
+    print(f"{B}│{R}  段 {sid}（{role}{'/'+task if task else ''}），段内第 {pos}{tag}")
+    print(f"{B}│{R}  层 {lr[0]}–{lr[1]}（{len(n.get('layers') or {})} 层），"
+          f"要拉 {n.get('weight_gb',0):.1f} GB，占显存约 {n.get('total_gb',0):.1f} GB")
+    print(f"{B}└─{R}")
+    print(f"""
+  mkdir -p {workdir} && cd {workdir} \\
+    && curl -fsSL http://{ip}:{port}/p2pmoe.tar.gz | tar xz \\
+    && curl -fsSL http://{ip}:{port}/plan.json -o /tmp/plan.json \\
+    && {py} -m pip install -q -r requirements-node.txt \\
+    && {py} -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node {nid} \\
+         --repo {repo} --out {weights} \\
+    && setsid nohup {py} -m p2pmoe.deploy.agent --id {nid} --bind 0.0.0.0:9101 \\
+         > /tmp/agent-{nid}.log 2>&1 &
+""")
+
+if not only:
+    gb = sum(n.get("weight_gb", 0) for n in m["nodes"])
+    print(f"{D}  ── 15 台合计拉 {gb:.0f} GB（全模型 160GB × 15 = 2400GB）。"
+          f"各台互不依赖，可以同时跑。{R}")
+    print(f"{D}  ── 都起来之后回控制机：./deploy_15.sh check 然后 ./deploy_15.sh measure{R}")
+PYEOF
 }
 
 # 代码与依赖不会自己长到节点上 —— 先把它们送过去。
@@ -173,6 +239,7 @@ cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS"; }
 case "${1:-all}" in
   sync)      cmd_sync ;;
   bootstrap) cmd_bootstrap ;;
+  cmds)      cmd_cmds "${2:-}" ;;
   check)   cmd_check ;;
   fetch)   cmd_fetch ;;
   start)   cmd_start ;;
@@ -180,5 +247,5 @@ case "${1:-all}" in
   measure) cmd_measure ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
-  *) echo "用法: $0 {sync|bootstrap|check|fetch|start|serve|measure|stop|all}"; exit 1 ;;
+  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|stop|all}"; exit 1 ;;
 esac
