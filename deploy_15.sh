@@ -483,6 +483,7 @@ if ! "\$NP" -c 'import torch' >/dev/null 2>&1; then
   done
 fi
 printf 'weights  %-12s ' "\$D"; [ -d "\$D" ] && echo "ok (\$(du -sh "\$D" 2>/dev/null | cut -f1))" || echo '✗ 没拉过'
+printf 'disk     %-12s ' ''; df -h --output=avail "\$(dirname "\$D")" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/$/ 可用/' || echo '?'
 printf 'port     %-12s ' '9101'; (ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -q ':9101 ' && echo '在听' || echo '空闲'
 printf 'log      %-12s ' ''; if [ -s "\$L" ]; then echo "\$L (\$(wc -l < "\$L") 行)"; else echo "\$L ✗ 不存在（进程连启动都没到）"; fi
 [ -s "\$L" ] && { echo '--- 日志末尾 ---'; tail -n 8 "\$L"; }
@@ -510,6 +511,16 @@ cmd_doctor() {
   for e in "${ids[@]}"; do
     local id=${e%%:*} ip=${e#*:}
     printf '\n\033[1m── %s @ %s\033[0m\n' "$id" "$ip"
+    # 这台按清单要拉多少 —— 和上面的 disk 一行放一起看才有意义
+    $PY - "$PLAN" "$id" <<'PYEOF' 2>/dev/null || true
+import json, sys
+m = json.load(open(sys.argv[1]))
+n = next((x for x in m["nodes"] if x["node"] == sys.argv[2]), None)
+if n:
+    lr = n.get("layer_range") or [0, 0]
+    print(f"   本机份额     层 {lr[0]}–{lr[1]}，要拉 {n['weight_gb']:.1f} GB"
+          f"（全模型 160GB，**不需要全量**）")
+PYEOF
     if [ "$(cat "$d/$id.rc" 2>/dev/null)" != 0 ]; then
       echo "   ✗ ssh 连不上：$(head -1 "$d/$id.err" 2>/dev/null)"
       nossh=$((nossh+1)); continue
