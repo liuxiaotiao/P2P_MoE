@@ -17,7 +17,17 @@ import json
 from pathlib import Path
 from typing import Mapping
 
-__all__ = ["TINY_QWEN3_MOE", "write_fake_checkpoint"]
+__all__ = ["TINY_QWEN3_MOE", "write_fake_checkpoint", "write_fake_tokenizer"]
+
+# 微型 checkpoint 的对话模板 —— 就是 Qwen3 的 ChatML 骨架，去掉 tools/thinking
+# 那些分支。留着它是为了让 `--chat` 这条路在测试里真的被走到：模板渲染错了
+# （比如多一个 BOS、少一个角色标记）在真模型上表现为「输出像坏了」，很难查。
+_CHAT_TEMPLATE = (
+    "{% for m in messages %}"
+    "<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
 
 TINY_QWEN3_MOE: dict = {
     "architectures": ["Qwen3MoeForCausalLM"],
@@ -29,7 +39,7 @@ TINY_QWEN3_MOE: dict = {
     "num_attention_heads": 4,
     "num_key_value_heads": 2,
     "head_dim": 16,
-    "vocab_size": 128,
+    "vocab_size": 512,
     "rms_norm_eps": 1e-6,
     "rope_theta": 1000000.0,
     "norm_topk_prob": True,
@@ -100,6 +110,14 @@ def write_fake_checkpoint(
         for k in chunk:
             weight_map[k] = name
 
+    (out / "generation_config.json").write_text(
+        # 与真 checkpoint 同一套语义：generation_config 的 eos 才是生成时该用的，
+        # 它和 config.json 里那个架构层面的 eos 可以不是同一个（Qwen3 就不是）。
+        json.dumps({"eos_token_id": _EOS_ID, "do_sample": False}, indent=2),
+        encoding="utf-8",
+    )
+    write_fake_tokenizer(out, vocab_size=V)
+
     (out / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": sum(
             t.numel() * t.element_size() for t in tensors.values())},
@@ -107,3 +125,51 @@ def write_fake_checkpoint(
         encoding="utf-8",
     )
     return out
+
+
+# --------------------------------------------------------------------------- #
+_SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+_EOS_ID = 2      # <|im_end|> —— 与 _SPECIALS 的下标一致
+
+_TRAIN_TEXT = [
+    "hello world", "the quick brown fox jumps over the lazy dog",
+    "把请求打进前段，绕环出 token", "分散环境下网络占九成",
+    "front segment back segment expert routing",
+    "你好，世界。这是一段用来训练微型分词器的中文。",
+]
+
+
+def write_fake_tokenizer(out_dir: str | Path, *, vocab_size: int = 512) -> Path:
+    """写一份能用的 byte-level BPE `tokenizer.json`。
+
+    **必须是 byte-level 的**，不能图省事用 word-level：整套增量解码的难点就在
+    「一个 token 可能是半个 UTF-8 字符」（中文一个字 3 字节，常被切成 2+1）。
+    word-level 分词器每个 token 都是完整字符，`Detokenizer` 那条 U+FFFD 回退
+    分支永远走不到 —— 测了等于没测。所以训练语料里特意有中文。
+
+    byte-level 的 256 个字节 token 是底座，vocab 至少要 256 + 特殊 token；
+    这也是 `TINY_QWEN3_MOE` 的 vocab_size 是 512 而不是 128 的原因。
+    """
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    tok = Tokenizer(models.BPE(unk_token=None))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    tok.train_from_iterator(
+        _TRAIN_TEXT,
+        trainers.BpeTrainer(vocab_size=int(vocab_size), special_tokens=list(_SPECIALS),
+                            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                            show_progress=False),
+    )
+    tok.save(str(out / "tokenizer.json"))
+    (out / "tokenizer_config.json").write_text(
+        json.dumps({
+            "eos_token": "<|im_end|>",
+            "pad_token": "<|endoftext|>",
+            "chat_template": _CHAT_TEMPLATE,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return out / "tokenizer.json"

@@ -14,7 +14,7 @@ from .tighten import detect_gap_robust, tighten_lex, band_from_median
 from .common_band import probe_exits, common_band, sweep_bandwidth, pick_bandwidth
 from .loop_trim import loop_profile, trim_by_loop
 from .experts import (
-    ActivationProfile, ExpertPlacement, build_placement, union_placement,
+    ActivationProfile, ExpertPlacement, build_placement, full_placement, union_placement,
     detectability, detectability_matrix, merge_candidates, expected_detection_tokens,
 )
 from .manifest import DeploymentManifest, NodePlan, LayerLoad, Pairing, build_manifest

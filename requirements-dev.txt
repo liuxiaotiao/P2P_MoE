@@ -5,7 +5,17 @@
 #
 # 节点上**不需要**装这些 —— 真机部署只要 requirements.txt。
 
--r requirements-node.txt   # 测试会覆盖真实模型执行层，所以要 torch/safetensors
+# 开发机上两侧都要装 —— 测试要同时覆盖控制机（文本层）与推理节点（执行层）。
+# 真机上没有哪台需要装齐两份：控制机装 control，节点装 node。
+-r requirements-node.txt      # torch / safetensors —— 真实模型执行层
+-r requirements-control.txt   # tokenizers / jinja2 —— 文本进出
 
 pytest>=7          # 部分用例会起真实子进程（标了 slow）；
                    # 真实模型层的用例在没装 torch 时会自动跳过
+
+transformers>=4.51 # **只用来当参考实现**（tests/test_reference_parity.py）：
+                   # 我们自己写的 Qwen3-MoE 前向要和官方的逐元素比对，否则
+                   # 「RoPE 拆反了」这种 bug 只会表现成「模型好像很笨」，
+                   # 在随机权重上肉眼永远看不出来。
+                   # 推理节点上**不装** —— 它的 fused MoE block 正是我们要
+                   # 替换掉的东西（拿不到 routing、不支持专家子集）。

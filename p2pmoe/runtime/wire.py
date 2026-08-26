@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import socket
 import struct
 import threading
@@ -29,7 +30,7 @@ from typing import Mapping
 
 import numpy as np
 
-__all__ = ["LinkTable", "send_msg", "recv_msg", "rpc", "Peer", "PeerPool", "Addr"]
+__all__ = ["RelayListener", "dial_via_relay", "LinkTable", "send_msg", "recv_msg", "rpc", "Peer", "PeerPool", "Addr"]
 
 _HDR = struct.Struct("!II")
 _LN2, _LN20 = log(2.0), log(20.0)
@@ -79,9 +80,25 @@ class LinkTable:
 
 
 # --------------------------------------------------------------------------- #
+def _as_wire_array(arr) -> np.ndarray:
+    """把 hidden state 归一成 float32 的连续 numpy 数组。
+
+    线上的 payload **恒为 float32**（第〇部分：接口只传字节，不传框架对象）——
+    所以 torch 后端的 bf16 张量在这里降到 float32，对端再升回去。这不是精度
+    妥协的疏忽，是接口定义：两端可以是不同 dtype、不同框架、不同设备。
+
+    这里用鸭子类型认 torch 张量（`.detach`）而不是 `import torch` —— wire 是
+    通信层，「装了 torch 才能通信」说不过去。`.float()` 已经给出 float32，
+    不需要引用 torch 的 dtype 常量，于是这条边界一行代码都不用破。
+    """
+    if hasattr(arr, "detach"):          # torch.Tensor：bf16/fp16/GPU 都要先落地
+        arr = arr.detach().to("cpu").float().numpy()
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
 def send_msg(sock: socket.socket, header: dict, arr: np.ndarray | None = None) -> None:
     if arr is not None:
-        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        arr = _as_wire_array(arr)
         header = {**header, "_shape": list(arr.shape)}
         payload = arr.tobytes()
     else:
@@ -111,11 +128,49 @@ def recv_msg(sock: socket.socket) -> tuple[dict, np.ndarray | None]:
 
 
 # --------------------------------------------------------------------------- #
-def rpc(addr: Addr, header: dict, *, timeout: float = 30.0) -> dict:
+def dial_via_relay(relay: Addr, me: str, to: str, *, timeout: float = 35.0) -> socket.socket:
+    """经中继要一条到 `to` 的连接。返回的就是一条普通 socket。
+
+    握手完就是裸流 —— 中继不解析消息（见 deploy/relay.py）。所以调用方拿到它
+    之后一切照旧：`send_msg` / `recv_msg` 不知道中间隔了一台机器。
+    """
+    s = socket.create_connection(relay, timeout=timeout)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        send_msg(s, {"type": "dial", "from": me, "to": to})
+        h, _ = recv_msg(s)
+        if not h.get("ok"):
+            raise ConnectionError(f"中继接不通 {to}：{h.get('why', h)}")
+        s.settimeout(None)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def rpc(addr: Addr, header: dict, *, timeout: float = 30.0,
+        relay: Addr | None = None, me: str = "__coord__", to: str | None = None) -> dict:
     """一次性请求-响应。用于控制面：采集能力、下发清单、驱动探测。
 
     数据面是 fire-and-forget 的（环自己转），只有控制面需要等回包。
+
+    `relay` 给了就经中继拨号，这时 `to`（对端节点 id）必填 —— 中继按 id 找人，
+    不按地址。
     """
+    if relay is not None:
+        if not to:
+            raise ValueError("经中继要给对端节点 id（to=）")
+        s = dial_via_relay(relay, me, to, timeout=timeout)
+        s.settimeout(timeout)
+        try:
+            send_msg(s, header)
+            reply, _ = recv_msg(s)
+            return reply
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
     s = socket.create_connection(addr, timeout=timeout)
     try:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -129,13 +184,90 @@ def rpc(addr: Addr, header: dict, *, timeout: float = 30.0) -> dict:
             pass
 
 
-class Peer:
-    """到某个对端的保温长连接。线程安全，断开自动重连。"""
+class RelayListener:
+    """替代监听 socket：预先在中继上挂几条连接，等别人来接。
 
-    def __init__(self, node_id: str, addr: Addr, *, retries: int = 40):
+    **接口刻意与 `socket` 对齐**（`accept` / `close` / `settimeout`），这样
+    `NodeServer.serve_forever` 那个循环一行都不用改 —— 节点不需要知道自己是在
+    监听端口还是挂在中继上。
+
+    预挂多条是为了省一个往返：一条被接走立刻补一条，拨号方来的时候总有现成的。
+    """
+
+    def __init__(self, relay: Addr, me: str, *, depth: int = 8):
+        self.relay = tuple(relay)
+        self.me = me
+        self.depth = depth
+        self._ready: "queue.Queue[socket.socket]" = queue.Queue()
+        self._stop = threading.Event()
+        self._timeout: float | None = None
+        self._threads: list[threading.Thread] = []
+        for _ in range(depth):
+            self._spawn()
+
+    def _spawn(self) -> None:
+        t = threading.Thread(target=self._park_one, daemon=True)
+        t.start()
+        self._threads.append(t)
+
+    def _park_one(self) -> None:
+        """挂一条连接，等它被接通；接通后交给 accept()，再补一条。"""
+        while not self._stop.is_set():
+            try:
+                s = socket.create_connection(self.relay, timeout=15.0)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                send_msg(s, {"type": "listen", "node": self.me})
+                s.settimeout(None)
+                h, _ = recv_msg(s)          # 阻塞到有人拨过来
+            except (OSError, ConnectionError):
+                if self._stop.is_set():
+                    return
+                time.sleep(0.5)             # 中继还没起来 / 网络抖 —— 重挂
+                continue
+            if h.get("type") != "accepted":
+                s.close()
+                continue
+            self._ready.put(s)
+            return                          # 这条已交出，由 accept() 补新的
+
+    def accept(self) -> tuple[socket.socket, Addr]:
+        try:
+            s = self._ready.get(timeout=self._timeout if self._timeout else None)
+        except queue.Empty:
+            raise socket.timeout("no pending relay connection")
+        self._spawn()                       # 补上被接走的那条
+        return s, self.relay
+
+    def settimeout(self, t: float | None) -> None:
+        self._timeout = t
+
+    def close(self) -> None:
+        self._stop.set()
+        while not self._ready.empty():
+            try:
+                self._ready.get_nowait().close()
+            except (queue.Empty, OSError):
+                break
+
+    def getsockname(self) -> Addr:
+        """没有真实监听地址 —— 报中继的，日志里好读。"""
+        return self.relay
+
+
+class Peer:
+    """到某个对端的保温长连接。线程安全，断开自动重连。
+
+    `relay` 给了就经中继拨号（节点之间没有直连时），否则直连 `addr`。
+    两条路返回的都是一条普通 socket，上层无从分辨 —— 这是有意的。
+    """
+
+    def __init__(self, node_id: str, addr: Addr, *, retries: int = 40,
+                 relay: Addr | None = None, me: str = "?"):
         self.node_id = node_id
         self.addr = addr
         self.retries = retries
+        self.relay = tuple(relay) if relay else None
+        self.me = me
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self.bytes_sent = 0
@@ -145,13 +277,16 @@ class Peer:
         last: Exception | None = None
         for _ in range(self.retries):
             try:
+                if self.relay:
+                    return dial_via_relay(self.relay, self.me, self.node_id)
                 s = socket.create_connection(self.addr, timeout=10.0)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 return s
-            except OSError as e:  # 对端还没起来
+            except (OSError, ConnectionError) as e:  # 对端还没起来
                 last = e
                 time.sleep(0.05)
-        raise ConnectionError(f"连不上 {self.node_id}@{self.addr}: {last}")
+        where = f"经中继 {self.relay}" if self.relay else f"@{self.addr}"
+        raise ConnectionError(f"连不上 {self.node_id} {where}: {last}")
 
     def send(self, header: dict, arr: np.ndarray | None = None) -> None:
         with self._lock:
@@ -196,6 +331,8 @@ class PeerPool:
     ):
         self.me = me
         self.links = links
+        self.relay: Addr | None = None
+        """给了就所有对端都经中继 —— 节点之间没有直连时（deploy/relay.py）。"""
         self.egress_ms = egress_ms
         self.egress_jitter_ms = egress_jitter_ms
         self._peers: dict[str, Peer] = {}
@@ -209,6 +346,10 @@ class PeerPool:
         with self._lock:
             self._addr[node_id] = tuple(addr)
 
+    def use_relay(self, relay: Addr | None) -> None:
+        """改走中继。地址表仍然要注册 —— 中继模式下地址只是个占位。"""
+        self.relay = tuple(relay) if relay else None
+
     def warm(self, node_ids) -> None:
         """预热：提前把连接建起来（II.4 Step 6 的「保温网格」）。"""
         for n in node_ids:
@@ -220,7 +361,7 @@ class PeerPool:
             if p is None:
                 if node_id not in self._addr:
                     raise KeyError(f"未注册的对端 {node_id}")
-                p = Peer(node_id, self._addr[node_id])
+                p = Peer(node_id, self._addr[node_id], relay=self.relay, me=self.me)
                 self._peers[node_id] = p
             return p
 

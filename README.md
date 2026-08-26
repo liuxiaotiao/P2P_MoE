@@ -46,6 +46,7 @@ python -m pytest -q tests/                       # 343 项测试
 | `planner/loop_trim.py` | II.4 Step 6、III.8.3 | 回环画像、升序裁剪、备胎池 |
 | `planner/hf_config.py` | — | HF config.json → ModelSpec；细粒度判据（模型适不适合本方案） |
 | `planner/experts.py` | I.1.1、II.5、III.7.3–7.4 | 逐层驻留专家集（身份）、前段并集、可检性矩阵 q(u,û)、池合并信号 |
+| `planner/static_pairing.py` | — | **静态简化模式**：前后段配对离线定死（贪心最小化组合延迟） |
 | `planner/manifest.py` | II.4、III.8.2 | 逐节点逐层加载清单、前后段组合矩阵、七项一致性校验 |
 | `planner/pipeline.py` | II.4 | 六步流水线编排、两条反馈口、终审与账本 |
 | `sim/network.py` | II.3.1 | 按「出口接入 + 骨干 + 入口接入」建模的可复现分散网络 |
@@ -55,6 +56,8 @@ python -m pytest -q tests/                       # 343 项测试
 | `runtime/weights.py` | I.1.1 | safetensors 选择性加载：按 (层, 专家 id) 过滤 key，只打开相关分片 |
 | `runtime/model.py` | I.1.1、II.5 | toy MoE：`PartialExpertMoEBlock` 只驻留子集专家、KV cache、miss 统计、drop-expert 重归一 |
 | `runtime/corpus.py` | I.1.1、II.5 | 回放语料、用全专家模型统计激活画像、**实测**告警基线与分类器参考 |
+| `runtime/profile.py` | I.1.1 | **激活画像**：逐层路由质量统计 → 驻留专家集（采/存/用） |
+| `runtime/text.py` | — | **文本进出（控制机侧）**：tokenizer、增量解码、chat template、停止条件 |
 | `runtime/identify.py` | II.5 | 直方图分类器、置信三区 |
 | `runtime/wire.py` | II.6、第〇部分 | 消息编解码、保温长连接、延迟抖动注入 |
 | `runtime/node.py` | II.5 | 节点 agent 进程：加载自己那份、段内转发、跨接口出段 |
@@ -62,10 +65,219 @@ python -m pytest -q tests/                       # 343 项测试
 | `deploy/agent.py` | — | 节点 agent 守护进程（两阶段启动） |
 | `deploy/probe.py` | II.3.1 | 真实网络探测：由节点自己发起的逐对测量 |
 | `deploy/control.py` | II.4、II.5 | 控制器：发现 → 探测 → 规划 → 下发 → 服务 |
+| `deploy/relay.py` | — | **中继**：节点之间没有直连时的接线员（握手后纯搬字节） |
+| `deploy/fetch.py` | — | **只拉本机要的那部分权重**：safetensors 逐张量 HTTP Range 下载 |
+| `deploy/manual.py` | — | **手动放置**：布局文件 → 部署清单 + 连线表，只校验不优化 |
+| `deploy/run.py` | — | **按给定布局跑**：连上 → 预检 → 下发 → 服务，不探测不规划 |
 | `deploy/launch.py` | — | 批量拉起/查看/停止 agent（ssh），systemd unit 模板 |
 
 测试只覆盖**有严格证明**的命题（§III.9 的「严格证明」清单）。启发式部分不写断言
 —— 给启发式写断言等于把调参结果冻进测试。
+
+执行层是例外，它有一条更硬的判据：`tests/test_reference_parity.py` 拿
+**transformers 官方的 Qwen3-MoE** 当参考，同一份权重同一个输入逐元素比对
+（prefill、decode、逐层中间结果、分段跑 vs 整段跑），最大误差 ~1e-6。
+自己手写 attention/RoPE/QK-norm/路由的代价就是这个 —— 错了不会抛异常，
+只会让输出「看起来像模型很笨」，而合成权重的输出本来就是乱码，肉眼分辨不了。
+
+---
+
+## 最短路径：布局你写，我只管连上跑
+
+不想让规划器决定怎么分？写个布局文件，直接跑：
+
+```json
+{
+  "model_dir": "/data/qwen3-30b-a3b",
+  "l0": 6,
+  "channels": [
+    {"front": "n1",         "back": ["n2", "n3", "n4"]},
+    {"front": ["n5", "n6"], "back": ["n7", "n8", "n9"]}
+  ]
+}
+```
+
+```bash
+# ① offline：布局 → 清单（不连机器、不要权重）
+python3 -m p2pmoe.deploy.run --spec deploy.json --plan-only --save-plan plan.json
+
+# ② 各节点只拉自己那部分权重
+python3 -m p2pmoe.deploy.launch fetch --hosts hosts.txt --plan plan.json \
+        --repo Qwen/Qwen3-30B-A3B --out /data/qwen3-part
+
+# ③ 建链 + 推理
+python3 -m p2pmoe.deploy.run --spec deploy.json \
+    --agents "$(python3 -m p2pmoe.deploy.launch agents --hosts hosts.txt)" \
+    --advertise 10.0.0.1 --model-dir /data/qwen3-part \
+    --chat --prompt "用一句话解释 MoE 的稀疏激活"
+```
+
+```
+[1/4] 布局：2 条通道，用 9 台机器，L₀=6（前段 1..6，后段 7..48）
+      ch0 [general]  前段 n1:1-6 → 后段 n2:7-20 n3:21-34 n4:35-48
+      专家：全装（无 drop-expert 近似，输出与单机逐位一致）
+[2/4] 预检   内存：最紧的是 n2（要 15.2 / 有 15.0 GB）   checkpoint：9 台都读得到
+[3/4] 下发   n2  back/Bgeneral0  层 7–20  从 checkpoint 读了 29.2%（5/16 个分片）
+[4/4] req0  F0×Bgeneral0  停于 eos  37 token  首token 812ms  «MoE 每个 token 只激活…»
+```
+
+层怎么切按机器数均分；要精确控制就把层区间写出来：
+
+```json
+{"front": [{"node": "n1", "layers": [1, 4]}, {"node": "n2", "layers": [5, 6]}],
+ "back":  [{"node": "n3", "layers": [7, 30]}, {"node": "n4", "layers": [31, 48]}]}
+```
+
+本地先演练一遍（起 N 个 agent 进程，不需要真机）：
+
+```bash
+python examples/manual_deploy.py --channels 2 --front 1 --back 2
+python examples/manual_deploy.py --spec deploy.json --real --chat --prompt "你好"
+```
+
+### 权重也只下需要的那部分
+
+选择性加载已经知道自己要哪些 key 了。把同一份 key 集合往上游推一层，就变成
+「只下这些字节」—— safetensors 的文件头里有每个张量的 `data_offsets`，
+HF 的 CDN 支持 HTTP Range：
+
+```bash
+# 每台节点上（--node 是它自己的名字，--out 各机同一个路径）
+python3 -m p2pmoe.deploy.fetch --repo Qwen/Qwen3-30B-A3B \
+        --plan plan.json --node n3 --out /data/qwen3-part
+
+# 或者让控制机把 15 台一起推起来（各节点直连上游，并行下）
+python3 -m p2pmoe.deploy.launch fetch --hosts hosts.txt --plan plan.json \
+        --repo Qwen/Qwen3-30B-A3B --out /data/qwen3-part
+```
+
+15 台跑 Qwen3-30B-A3B（3 条通道 × 5 台），后段全装专家时：
+
+| | 下载量 |
+|---|---|
+| 每台都下全量 | 916 GB |
+| **只下本机需要的** | **179 GB**（省 80%） |
+| 后段再按画像装 20% 专家 | 约 45 GB |
+
+产出的是一个**更小但完全合法**的 checkpoint 目录，`--model-dir` 指过去即可，
+节点侧代码一行不用改。张量与上游**逐位一致**（测试里逐个比对过 —— 搬错一个偏移
+不会抛异常，只会让权重变成噪声，而噪声权重照样出 token，肉眼看不出来）。
+
+`--mode shard` 是兜底：只下含目标 key 的整个分片。省得少，但不依赖 Range。
+上游无视 Range 时脚本会**明确报出来**而不是将就 —— 将就的话「省下载」根本没发生，
+拼出来的文件还是错的。
+
+### 后段只装 hot expert 损失多大
+
+drop-expert 被文档标注为「运维近似，非无损」—— 但从来没量过有多不无损。
+现在可以量：
+
+```bash
+python examples/drop_expert_impact.py --model-dir /data/qwen3-30b-a3b \
+    --profile prof.json --coverage 0.9 0.95 0.99
+```
+
+```
+  覆盖率   后段每层    miss率    丢门控        KL   top1一致   生成分叉于
+   0.90    5.4/8    16.7%    0.066   0.0286      75%      第 1 步
+   0.95    6.2/8     9.4%    0.036   0.0144      81%      第 1 步
+   0.99    7.4/8     0.0%    0.000   0.0000     100%        未分叉
+```
+
+三个指标量的是不同的事：**miss 率**是通道二的观测量，但丢掉的可能是门控权重
+0.02 的那个；**丢门控质量**更诚实；**KL** 才是输出分布的实际距离。
+
+### 缺专家时怎么补救：三种策略
+
+`--miss-policy` 三选一，缺失发生时才有区别：
+
+| | 做法 | 缺失时用几个专家 |
+|---|---|---|
+| `drop`（默认，文档 II.5） | 跳过缺失的，剩下的**重归一** | < k，最坏 0 个（只走残差） |
+| `drop_noscale` | 跳过缺失的，**不重归一** | 同上，但贡献按丢掉的质量成比例缩小 |
+| `local_topk` | 把路由概率**限制到驻留集**再取 top-k | 恒为 k，不会退化成零 |
+
+**没有缺失时三者完全等价** —— 全量 top-k 都在驻留集里，限制后再取选出的是同一批。
+所以「驻留集覆盖实际路由时逐位一致」这条性质在三种策略下都成立（有测试钉住）。
+
+实测（合成权重，`--policy` 横向对比）：
+
+```
+覆盖率   后段每层   miss率   KL·drop  KL·drop_noscale  KL·local_topk   最好的
+ 0.70    3.2/8   42.7%    0.1007           0.0686         0.1160  drop_noscale
+ 0.85    5.0/8   22.9%    0.0317           0.0184         0.0342  drop_noscale
+ 0.95    6.2/8    6.2%    0.0144           0.0080         0.0143  drop_noscale
+```
+
+**`drop_noscale` 全程最好**，KL 低 1.5–2 倍。直觉是：重归一等于宣称「路由本来
+就只想要剩下这几个」，而那不是事实 —— 它把一个低概率专家的输出放大到权重 1。
+不重归一则让这一层的 FFN 贡献按丢掉的门控质量成比例缩小，缺得越多越接近
+「只走残差」，退化是平滑的。
+
+**但这个结论很可能被随机权重误导**：合成模型里各专家的输出是互不相关的随机方向，
+「用错专家」等于加一个随机向量，而「什么都不加」离均值更近。真模型的专家彼此
+相关（都在做合理的事），替补一个次优专家大概率比什么都不做强 —— 也就是说
+`local_topk` 在真权重上会比这里好看。**默认保持 `drop` 是为了忠于文档；
+真上线前拿这个脚本在真权重上测一遍再定。**
+
+**「生成分叉于」这一列最该看。** prefill 偏差小推不出生成没问题 —— decode 的
+误差会沿步累积，而且被扰动的 hidden state 会选出不同的专家，越走越偏。
+不过它也最脆：top-1 与 top-2 间距小时再小的扰动都会翻。所以**看 KL 判断质量，
+看分叉判断可复现性**。
+
+（上表出自合成权重，路由接近均匀、hot expert 概念退化，只用来验工具。
+真模型上分布集中得多，同样覆盖率只要 10–20% 的专家。）
+
+### 后段只装该装的专家
+
+默认全装（无近似）。要让后段真的只驻留 n_{u,l} 个专家，得先知道**哪些** ——
+这个知识只能来自真实数据上的真实路由。跑两轮就有了：
+
+```bash
+# 第一轮：全装跑一遍，顺便把路由统计下来
+python3 -m p2pmoe.deploy.run --spec deploy.json --agents ... \
+        --prompt "$(cat 这个task的真实请求.txt)" --profile-out prof.json
+
+# 第二轮：按画像只装子集
+python3 -m p2pmoe.deploy.run --spec deploy.json --agents ... \
+        --profile prof.json --coverage 0.95
+```
+
+```
+第一轮  n2  back/Bgeneral0  层 7–20   1792 个专家  从 checkpoint 读了 29.2%
+        画像已存 prof.json
+          @ 覆盖率 95%  general: 42 层，每层 14–31 个（层均 21.4/128，约 17%）
+
+第二轮  专家（画像 @ 覆盖率 95%）：general: 42 层，每层 14–31 个（层均 21.4/128）
+        n2  back/Bgeneral0  层 7–20    300 个专家  从 checkpoint 读了 6.1%
+```
+
+**为什么第一轮必须全装**：只驻留子集时输出被 drop-expert 近似带偏，后面几层的
+路由就不是真实路由了 —— 采到的画像会把自己的错误固化下来。两个参数一起给会直接报错。
+
+**为什么采得到**：路由是全量的，即使专家不是。`mlp.gate.weight` 每层都完整加载
+（它比一个专家还小），所以 `MoEStats.hist` 记的是 top-k 在**全部** E 个专家上的
+质量分布 —— 哪怕本地只驻留了 3 个。否则画像只会确认已有的选择，
+「换一批专家会不会更好」这个问题就问不出来。
+
+**为什么存质量而不是 id**：覆盖率（0.9？0.95？0.99）是个内存换质量的部署期权衡。
+存分布的话换阈值不用重新采样；存 id 就把这个选择冻死在采样那一刻了。
+
+逐 task 分开：多条通道写不同的 `"task"`，把各自的请求打进去，画像就是逐 task 的
+S_{u,l}。前段不参与 —— 它是 task 无关的（I.1.1），装全集。
+
+**它不做什么，说清楚**：不探测、不估容量、不选 L₀、不建段、不算公共中值域、
+不做回环裁剪。所以方案文档的那些结论（零后悔、任意组合、延迟均匀）在这条路上
+**不成立** —— 它们的前提是「离线把组合极差压到抖动量级以下」，而这里没人去压。
+这条路只保证一件事：**按你说的装上、连上、能出 token。**
+
+它仍然会拦住的事（都在下发之前，一次报完）：层中间漏了没人算、段内层区间不连续、
+最后几层没人管、一台机器被两条段用（I.2.2 排他，否则两条请求会互相污染 KV）、
+各通道 L₀ 不一致、专家 id 越界、内存明显不够、节点读不到 checkpoint。
+这些错误的症状都很隐蔽 —— 层没接上不会报错，只会让输出静默变成垃圾。
+
+想要规划器那一套，走 [`deploy/control.py`](DEPLOY.md)。两条路产出的是同一种
+`DeploymentManifest`，节点侧完全一样。
 
 ---
 
@@ -156,9 +368,129 @@ r07   Y    F2    BY0      169ms     89ms    280ms   ← Y 池只有 1 条，还�
 
 ---
 
+## 文本进出
+
+请求进来是一句话，出去是一句话；节点那边自始至终只见 token id。
+
+```python
+from p2pmoe.runtime.text import TextIO
+
+textio = TextIO.from_model_dir("/path/to/Qwen3-30B-A3B", chat=True)
+coord  = Coordinator(manifest, ..., textio=textio,
+                     on_text=lambda rec, delta: print(delta, end=""))
+rec = coord.submit("r0", text="用一句话解释 MoE 的稀疏激活")
+rec.done.wait()
+print(rec.text, rec.stop_reason)     # → "..." "eos"
+```
+
+命令行：
+
+```bash
+python examples/static_qwen.py --chat --prompt "你好" --prompt "hello"
+python -m p2pmoe.deploy.control --agents ... --model-dir /path/to/model --chat        --prompt "用一句话解释 MoE"
+```
+
+三件容易被做错、这里都做了的事：
+
+**增量解码不能逐 token 拼。** byte-level BPE 的一个 token 可以是半个 UTF-8 字符
+（汉字 3 字节，常被切成 2+1）。单独解那半个字节得到的是 `�`，而且**错误不可逆**
+—— 后面补上的字节救不回来。正确做法是整段重解取增量，结尾是 `�` 就先不吐字。
+
+**停止 token 要读 `generation_config.json`，不是 `config.json`。** 两个文件里的
+`eos_token_id` 可以不同：Qwen3 的 config 是 151643 `<|endoftext|>`，
+generation_config 是 151645 `<|im_end|>`。只读前者的话，对话模型永远等不到那个
+它其实已经吐出来的结束符。
+
+**指令模型必须套 chat template。** 不套是 completion 语义，输出看起来像模型坏了。
+模板就在 `tokenizer_config.json` 里，用 jinja2 渲染 —— transformers 底下做的
+也是同一件事。
+
+依赖因此分成三份，互不包含：
+
+| 文件 | 内容 | 谁装 |
+|---|---|---|
+| `requirements.txt` | numpy | 两边 |
+| `requirements-control.txt` | + tokenizers、jinja2 | 控制机 |
+| `requirements-node.txt` | + torch、safetensors | 推理节点 |
+
+**控制机不碰张量，节点不碰文本。** 不是洁癖 —— 15 台节点上少一套分词器、
+控制机上少几 GB 的 CUDA 依赖，`test_requirements.py` 两条对称的测试守着它。
+
+---
+
+## 简化版：把链路在部署时定死
+
+如果暂时不想要「到达时 task 未知 → 在线识别 → 任意组合」这一整套，可以走
+**静态模式**：每条前段的 task 在部署时给定，前后段怎么连也在离线算好、随配置
+下发。请求自报 task，在线就只剩「按 task 取一条通道」。
+
+```bash
+python examples/static_qwen.py                          # 合成的微型 Qwen3-MoE
+python examples/static_qwen.py --preset qwen3-30b-a3b   # 只规划，不要权重
+python examples/multinode_local.py --nodes 15 --static  # 15 进程演练
+python -m p2pmoe.deploy.control --agents ... --static   # 真机
+```
+
+连接默认自动配对（贪心最小化组合延迟）。要自己指定：先 `--save-plan` +
+`--save-wiring` 存下来，改完再 `--load-plan` + `--wiring` 喂回去 —— 载清单是
+必须的，因为放置依赖不可复现的延迟实测，不固定住的话段 id 每次都可能变。
+完整步骤见 [DEPLOY.md](DEPLOY.md) 第 5 步。
+
+|  | 主线 | 静态 |
+|---|---|---|
+| 前段驻留 | 并集 ∪_u S_{u,l} | **全部专家** |
+| task 来源 | 前段 tail 在线识别 | 请求给定 |
+| 配对 | 到达时 pop，任意组合 | 离线定死 |
+| 在线控制面 | 识别 → 要后段（一个 RTT） | 无 |
+| 换绑 | 通道二触发 | 不存在 |
+| 公共中值域 | 必需（它保证任意组合成立） | 退化成「选中的那几对齐就行」|
+
+**换来的**：少一个控制面 RTT，少一整套分类器 / 检出 / 换绑，好调试；前段不需要
+激活画像就能装，将来加 task 也不用重装前段。
+
+**放弃的**：I.1.1 的「到达时 task 未知」这个前提本身；负载不能在通道之间流动
+（某个 task 变热只能重新下发配对）；备胎顶替要改配置而不是自动发生。
+
+**代价看得见** —— `--preset qwen3-30b-a3b` 会把两种口径并排打出来：
+
+```
+L₀ = 6（前段 1..6，后段 7..48）
+前段驻留 7.5GB（全集），可单节点承载的机器 15/15 台
+── 对照：若前段只装并集（87/128 个/层），L₀ 可到 6、前段 5.2GB、通道上限 7
+
+5 条静态通道，组合 p50 75–86ms（极差 11ms）
+  ch0  X  F0 × BX0   正向 29.1ms  回环 29.1ms  组合 75.0ms
+  ch2  Y  F4 × BY0   正向 33.2ms  回环 35.7ms  组合 85.7ms
+```
+
+真正吃内存的那部分 —— 逐节点逐层放置、每层只驻留指定专家、段内流水、绕环
+decode、drop-expert、有界等待 —— 一条没少。
+
+---
+
 ## 在多台真实机器上运行
 
+> 15 台跑 Qwen3-30B-A3B 的**逐条指令**见 [RUNBOOK.md](RUNBOOK.md) —— 从裸机到第一个
+> token，每条都标了在哪台机器上执行。下面是解释与其它选项。
+
 每台节点起一个 agent，控制机跑一次控制器。就两条命令。
+
+**节点之间不需要 SSH** —— 数据面是节点直接互发的 TCP（agent 端口，默认 9101）。
+`ssh` 只出现在 `deploy/launch.py` 里，那是批量起停的便利脚本；不配 SSH 就用
+`--dry-run` 把命令拿去各机自己跑，或者走 systemd。
+
+**但节点之间要两两可达。** 都在 NAT 后面、连不通的话，用 VPN overlay
+（WireGuard/Tailscale，恢复真直连），或者跑一个中继：
+
+```bash
+python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200        # 有公网入站的那台
+python3 -m p2pmoe.deploy.agent --id n3 --relay HOST:9200  # 节点：不监听端口
+python3 -m p2pmoe.deploy.run  --spec deploy.json --relay HOST:9200 ...
+```
+
+中继是接线员不是代理 —— 握手完只搬字节，协议与节点逻辑一行不用改。
+代价是每跳绕一圈、逐 token 延迟大致翻倍，且它是带宽瓶颈与单点。
+连通性要求见 [DEPLOY.md](DEPLOY.md#需要哪些连通性先确认这个)。
 
 ```bash
 # 每台节点（10.0.0.11、10.0.0.12、…）

@@ -1,0 +1,19 @@
+# 控制机的额外依赖 —— **只有跑控制器（规划、探测、下发、收发请求）的那台需要**
+#
+#     pip3 install -r requirements-control.txt
+#
+# 推理节点**不需要**这些：节点自始至终只见 token id —— head(f) 拿 id 查嵌入表、
+# tail(b) 采样出 id，环里传的是 hidden state。文本在控制机的入口编码、出口解码。
+#
+# 反过来也成立：控制机不需要 requirements-node.txt 里的 torch/safetensors。
+# 两份依赖互不包含，`test_requirements.py` 守着这条线。
+
+-r requirements.txt
+
+tokenizers>=0.15        # HF 的 tokenizer 单独包（AutoTokenizer 底下跑的就是它）
+                        # 不装 transformers 是因为它会拖进 torch 与几百 MB 的模型代码，
+                        # 而我们只要编解码这一件事
+
+jinja2>=3.0             # 渲染 checkpoint 自带的 chat template。
+                        # transformers 内部也是用它渲染同一份模板字符串 ——
+                        # 指令模型不套模板的话输出会像坏了，所以这不是可选项

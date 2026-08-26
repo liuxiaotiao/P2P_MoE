@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--id", required=True, help="节点 id，全池唯一（如 g1 / v3）")
     ap.add_argument("--bind", default="0.0.0.0:9101", help="监听地址，默认 0.0.0.0:9101")
+    ap.add_argument("--relay", default=None, metavar="HOST:PORT",
+                    help="**节点之间没有直连时用这个**（家宽 NAT 后面等）："
+                         "不监听任何端口，改成挂到中继上，只需要一条出站连接。"
+                         "代价是每跳绕一圈，逐 token 延迟大致翻倍 —— "
+                         "见 deploy/relay.py")
     ap.add_argument("--mem-mb", type=float, default=None,
                     help="声明可用内存（MB）。不给则读 /proc/meminfo；"
                          "真实 GPU 节点上应填显存")
@@ -60,12 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     host, port = parse_bind(args.bind)
+    relay = None
+    if args.relay:
+        rh, _, rp = args.relay.rpartition(":")
+        relay = (rh or "127.0.0.1", int(rp))
     srv = NodeServer(args.id, host=host, port=port, mem_mb=args.mem_mb,
-                     access_ms=args.access_ms, access_jitter_ms=args.access_jitter_ms)
+                     access_ms=args.access_ms, access_jitter_ms=args.access_jitter_ms,
+                     relay=relay)
     caps = srv.capabilities()
     log.info(
-        "agent %s 已启动，监听 %s:%d；可用内存 %.0fMB，基准 %.3fms/单位%s",
-        args.id, host, srv.port, caps["mem_mb"], caps["ms_per_layer"],
+        "agent %s 已启动，%s；可用内存 %.0fMB，基准 %.3fms/单位%s",
+        args.id,
+        f"经中继 {relay[0]}:{relay[1]}（不监听端口）" if relay
+        else f"监听 {host}:{srv.port}",
+        caps["mem_mb"], caps["ms_per_layer"],
         f"；模拟接入段 {args.access_ms:.0f}±{args.access_jitter_ms:.0f}ms"
         if args.access_ms > 0 else "",
     )

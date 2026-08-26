@@ -131,6 +131,35 @@ def build_placement(
     )
 
 
+def full_placement(
+    n_layers: int, n_experts: int, *, name: str = "front-full"
+) -> ExpertPlacement:
+    """前段逐层驻留**全部**专家。
+
+    这不是文档的主线 —— I.1.1 说的是并集 ∪_u S_{u,l}，比全集小。全集是它的
+    一个**保守上界**，用在静态简化模式里，理由是工程性的而非理论性的：
+
+    * 并集要先有各 task 的真实激活画像才算得出来；全集不需要画像，
+      部署当天就能装；
+    * 前段是 task 无关的（I.1.1），将来加一个新 task 时并集会变、前段要重装，
+      全集不会 —— 前段一次装好，后段随 task 增删；
+    * 覆盖率恒为 1，通道二在前段侧的基线 miss 归零，少一个要标定的量。
+
+    **代价是内存**：Qwen3-30B-A3B 上前段每层从「并集约 40%」涨到 100%，
+    L₀ 处的前段总量按比例上去，直接压缩可建的通道数。所以它只适合
+    「大内存节点富余、task 数多到并集本来就接近全集」的池子 —— 对 Qwen3-30B-A3B
+    的 16/24GB 混合池，跑 `examples/model_fit.py` 看 L₀ 与通道数的实际代价。
+    """
+    full = frozenset(range(n_experts))
+    return ExpertPlacement(
+        name=name,
+        n_layers=n_layers,
+        sets=tuple(full for _ in range(n_layers)),
+        achieved_coverage=tuple(1.0 for _ in range(n_layers)),
+        coverage_target=1.0,
+    )
+
+
 def union_placement(
     placements: Sequence[ExpertPlacement], *, name: str = "front-union"
 ) -> ExpertPlacement:

@@ -318,6 +318,13 @@ class SegmentModel:
             for l, es in layer_experts.items()
         }
         self._kv: dict[str, dict[int, dict]] = {}
+        self.profiler = None
+        """逐层激活画像的累加器。默认 None —— 见 runtime/profile.py。"""
+
+    def enable_profiling(self) -> None:
+        from .profile import LayerProfiler
+
+        self.profiler = LayerProfiler(self.cfg.n_experts)
 
     # -- 计量 -------------------------------------------------------------- #
     @property
@@ -335,6 +342,9 @@ class SegmentModel:
         h = x
         for l in self.layers:
             h, st = self.blocks[l].forward(h, kv.setdefault(l, {}))
+            if self.profiler is not None:
+                # 逐层记，不是合并后再记 —— 驻留集是逐层决定的（n_{u,l} 异构）
+                self.profiler.record(l, st.hist, st.n_token_layer)
             total = total.merge(st)
         return h, total
 

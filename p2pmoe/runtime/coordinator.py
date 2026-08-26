@@ -31,9 +31,10 @@ import numpy as np
 from ..planner.experts import ExpertPlacement
 from ..planner.manifest import DeploymentManifest
 from .identify import HistogramClassifier
+from .text import TextIO
 from .model import ToyMoEConfig
 from .node import NodeConfig, run_agent
-from .wire import Addr, LinkTable, PeerPool, recv_msg, rpc
+from .wire import Addr, LinkTable, PeerPool, RelayListener, recv_msg, rpc
 
 __all__ = ["RequestRecord", "Coordinator", "LocalCluster"]
 
@@ -52,6 +53,19 @@ class RequestRecord:
     conf: float = 0.0
     scores: dict[str, float] = field(default_factory=dict)
     tokens: list[int] = field(default_factory=list)
+    prompt: str = ""
+    """原始文本（走文本入口时才有；直接喂 id 的话是空串）。"""
+    text: str = ""
+    """已生成的文本 —— 由增量解码逐 token 拼出来，不是最后 decode 一次。"""
+    stop_reason: str = ""
+    """"eos" | "stop_string" | "max_tokens"。空串表示还没结束。"""
+    _detok: object = None
+    traces: dict = field(default_factory=dict)
+    """节点 id → 该节点在这条请求上的埋点（计算时长、前向次数、发出字节）。
+
+    只有时长，没有时刻 —— 15 台机器没有时钟同步，跨机的绝对时刻拼不到一条轴上。
+    所以「网络时间」是 `总时延 − 各节点计算 − 排队` 反推出来的，不是测出来的。
+    """
     token_ms: list[float] = field(default_factory=list)
     miss_window: deque = field(default_factory=lambda: deque(maxlen=16))
     rebinds: int = 0
@@ -90,6 +104,8 @@ class RequestRecord:
         return max(0.0, (self.t_back - self._t_classified) * 1000) if self.t_back else 0.0
 
     _t_classified: float = 0.0
+    finished: bool = False
+    """完成判定已经做过。**不能用 `done` 代替** —— 见 `Coordinator._finish`。"""
 
 
 # --------------------------------------------------------------------------- #
@@ -104,8 +120,22 @@ class Coordinator:
         min_window: int = 6,
         host: str = "127.0.0.1",
         port: int = 0,
+        static_wiring: Mapping[str, tuple[str, str]] | None = None,
+        textio: "TextIO | None" = None,
+        on_text=None,
+        relay: Addr | None = None,
     ):
         self.man = manifest
+        # 文本进出是**可选**的：不给就是 id 进 id 出（toy 模型、协议测试都这么用）。
+        # 给了才有 prompt 编码、增量解码、EOS 停止。tokenizer 只活在控制机上，
+        # 节点那边什么都不用变 —— 见 runtime/text.py 开头。
+        self.text = textio
+        self.on_text = on_text
+        """流式回调 on_text(rec, delta)。每吐出一段新文本调一次。"""
+        # 静态模式：{前段 id: (后段 id, task)}，配对在部署时定死。
+        # 给了它就不走识别→派发那条路，请求直接说明自己是哪个 task。
+        self.static_wiring = dict(static_wiring or {})
+        self.static = bool(self.static_wiring)
         self.baselines = dict(baselines)
         self.priors = dict(priors)
         self.alarm_factor = alarm_factor
@@ -126,6 +156,15 @@ class Coordinator:
                         if p.role == f"back:{u}"})
             )
 
+        if self.static:
+            # 前段按 task 分池 —— 静态模式下一条前段只服务一个 task
+            self.free_fronts = deque()
+            self.front_pools: dict[str, deque[str]] = {}
+            for f, (_, task) in sorted(self.static_wiring.items()):
+                self.front_pools.setdefault(task, deque()).append(f)
+        else:
+            self.front_pools = {}
+
         self.seg_head = {sid: info["head"] for sid, info in manifest.segments.items()}
         self.seg_nodes = {sid: list(info["nodes"]) for sid, info in manifest.segments.items()}
 
@@ -141,11 +180,17 @@ class Coordinator:
         self.pool: PeerPool | None = None
         self.errors: list[str] = []
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((host, port))
-        self.sock.listen(128)
-        self.host, self.port = self.sock.getsockname()[:2]
+        # 中继模式：协调器也挂到中继上（节点连不到它，只能反过来）
+        self.relay = tuple(relay) if relay else None
+        if self.relay:
+            self.sock = RelayListener(self.relay, "__coord__")
+            self.host, self.port = self.relay
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind((host, port))
+            self.sock.listen(128)
+            self.host, self.port = self.sock.getsockname()[:2]
         self._stop = threading.Event()
         self.max_tokens = 12
 
@@ -184,6 +229,12 @@ class Coordinator:
 
     def queue_depths(self) -> dict:
         with self._lock:
+            if self.static:
+                return {
+                    "mode": "static",
+                    "waiting": len(self._arrivals),
+                    "free_channels": {u: len(q) for u, q in self.front_pools.items()},
+                }
             return {
                 "waiting_front": len(self._arrivals),
                 "waiting_back": {u: len(q) for u, q in self._await_back.items() if q},
@@ -202,20 +253,44 @@ class Coordinator:
     def submit(
         self,
         req: str,
-        ids: Sequence[int],
+        ids: Sequence[int] | None = None,
         *,
+        text: str | None = None,
         true_task: str | None = None,
         force_task: str | None = None,
+        task: str | None = None,
     ) -> RequestRecord:
         """到达：盲绑一条空闲前段。不比不挑（推论 III.3.2）。
+
+        静态模式下 `task` 必填（或由 true_task 兜底）：配对是部署时定死的，
+        协调器只需按 task 取一条空闲通道，不做识别也不做派发。
 
         force_task 是**故障注入**：无视识别结果，强行绑到指定的池。用来验证
         通道二（miss 率检出）与换绑路径确实工作 —— 就像给一个正确的系统注入
         一个已知错误，看它能不能自己发现并纠正。
         """
+        if text is not None:
+            if self.text is None:
+                raise ValueError(
+                    "协调器没配 tokenizer，收不了文本 —— "
+                    "要么传 ids，要么 Coordinator(textio=TextIO.from_model_dir(...))"
+                )
+            if ids is not None:
+                raise ValueError("text 与 ids 二选一")
+            ids = self.text.encode_prompt(text)
+        elif ids is None:
+            raise ValueError("submit 需要 ids 或 text")
+
         rec = RequestRecord(req=req, true_task=true_task, ids=list(ids))
+        rec.prompt = text or ""
+        if self.text is not None:
+            rec._detok = self.text.stream()
         rec.force_task = force_task
         rec.t0 = time.perf_counter()
+
+        if self.static:
+            return self._submit_static(rec, task or true_task)
+
         with self._lock:
             self.records[req] = rec
             if self.free_fronts:
@@ -229,6 +304,36 @@ class Coordinator:
         self._start_front(rec)
         return rec
 
+    def _submit_static(self, rec: RequestRecord, task: str | None) -> RequestRecord:
+        """静态模式的到达：按 task 取一条通道，前后段是绑好的。"""
+        if not task:
+            raise ValueError("静态模式下 submit 必须给 task —— 配对在部署时就定死了")
+        with self._lock:
+            self.records[rec.req] = rec
+            q = self.front_pools.get(task)
+            if q is None:
+                raise ValueError(f"没有服务 task {task} 的静态通道；有的是 "
+                                 f"{sorted(self.front_pools)}")
+            if q:
+                rec.front = q.popleft()
+            else:
+                self._arrivals.append(rec)
+                depth = len(self._arrivals)
+        if not rec.front:
+            rec.task = task
+            rec.log(f"到达（task={task}）→ {task} 通道池空，排队（队深 {depth}）")
+            return rec
+        rec.task = task
+        rec.back = self.static_wiring[rec.front][0]
+        with self._lock:
+            self.pairings.append((rec.req, rec.front, rec.back, task))
+        rec.t_front = rec.t_back = time.perf_counter()
+        rec.log(f"到达（task={task}）→ 静态通道 {rec.front} × {rec.back}"
+                f"（配对在部署时定死，无识别、无派发 RTT）")
+        self.pool.send(self.seg_head[rec.front],
+                       {"type": "prefill", "req": rec.req, "ids": rec.ids}, delay=False)
+        return rec
+
     def _start_front(self, rec: RequestRecord) -> None:
         rec.t_front = time.perf_counter()
         w = rec.wait_front_ms
@@ -239,6 +344,25 @@ class Coordinator:
 
     def _release_front(self, f: str) -> None:
         """前段用完归还。若有请求在排队，直接交给队首而不是先入池再出池。"""
+        if self.static:
+            task = self.static_wiring[f][1]
+            with self._lock:
+                waiting = [r for r in self._arrivals if r.task == task]
+                if waiting:
+                    nxt = waiting[0]
+                    self._arrivals.remove(nxt)
+                    nxt.front = f
+                    nxt.back = self.static_wiring[f][0]
+                    self.pairings.append((nxt.req, f, nxt.back, task))
+                else:
+                    self.front_pools[task].append(f)
+                    return
+            nxt.t_front = nxt.t_back = time.perf_counter()
+            nxt.log(f"出队 → 静态通道 {f} × {nxt.back}（等了 {nxt.wait_front_ms:.0f}ms）")
+            self.pool.send(self.seg_head[f],
+                           {"type": "prefill", "req": nxt.req, "ids": nxt.ids},
+                           delay=False)
+            return
         with self._lock:
             if self._arrivals:
                 nxt = self._arrivals.popleft()
@@ -267,6 +391,14 @@ class Coordinator:
             self._on_token(h)
         elif t == "error":
             self.errors.append(f"{h.get('node')}: {h.get('trace')}")
+        elif t == "static_forward":
+            rec = self.records.get(h.get("req", ""))
+            if rec:
+                rec.log(f"{h['node']} 静态转发 → {h['peer']}（task={h.get('task')}）")
+        elif t == "req_trace":
+            rec = self.records.get(h.get("req", ""))
+            if rec is not None:
+                rec.traces[h["node"]] = h
         elif t == "kv_dropped":
             rec = self.records.get(h.get("req", ""))
             if rec:
@@ -319,7 +451,12 @@ class Coordinator:
 
     def _on_token(self, h: dict) -> None:
         rec = self.records.get(h["req"])
-        if rec is None:
+        if rec is None or rec.finished:
+            # 完成判定与「release 送达各节点」之间有一个窗口，环里可能还有一个
+            # 在途的 token 正绕回来。它是**已经算出来**的、合法的 token，只是
+            # 到晚了 —— 收下它会让 tokens 超出 max_tokens 并二次触发 _finish，
+            # 于是同一条通道被归还两次，池深凭空长大。丢弃是对的：环是异步的，
+            # 「停」这个决定必然要在某个已经发出的计算之后生效。
             return
         st = h["back_stats"]
         rate = st["miss"] / st["ntl"] if st["ntl"] else 0.0
@@ -334,11 +471,36 @@ class Coordinator:
         else:
             rec.token_ms.append((now - rec._last) * 1000)
         rec._last = now
-        rec.tokens.append(h["token"])
+        token = h["token"]
+        rec.tokens.append(token)
+
+        # ---- 文本层：增量解码与停止判定（都在控制面） ----
+        if self.text is not None:
+            if self.text.stop.hit_id(token):
+                # EOS 不进文本 —— 它是控制符，不是内容。
+                rec.tokens.pop()
+                rec.stop_reason = "eos"
+                rec.log(f"模型自己收尾（EOS token={token}）")
+                self._finish(rec)
+                return
+            delta = rec._detok.push(token)
+            if delta:
+                rec.text += delta
+                if self.on_text:
+                    self.on_text(rec, delta)
+            hit = self.text.stop.hit_text(rec.text)
+            if hit:
+                rec.stop_reason = "stop_string"
+                rec.log(f"命中停止串 {hit!r}")
+                self._finish(rec)
+                return
 
         # ---- 通道二：滑窗 miss 率 vs 基线（II.5） ----
+        # 静态模式下 task 是给定的，不存在误绑 —— 仍然统计 miss 率（它反映
+        # 驻留集覆盖得够不够），但不触发换绑。
         base = self.baselines.get(rec.task, 0.03)
-        if (len(rec.miss_window) >= self.min_window
+        if (not self.static
+                and len(rec.miss_window) >= self.min_window
                 and rec.window_miss > base * self.alarm_factor
                 and rec.rebinds < 2):
             rec.log(
@@ -349,6 +511,7 @@ class Coordinator:
             return
 
         if len(rec.tokens) >= self.max_tokens:
+            rec.stop_reason = "max_tokens"
             self._finish(rec)
 
     def _rebind(self, rec: RequestRecord) -> None:
@@ -372,14 +535,44 @@ class Coordinator:
         self._bind(rec, nxt, rebind=True)
         self._release_back(old_task, old)   # 归还旧后段，可能立刻被排队者接走
 
+    def expected_trace_nodes(self, rec: RequestRecord) -> list[str]:
+        return sorted(set(self.seg_nodes.get(rec.front, []))
+                      | set(self.seg_nodes.get(rec.back, [])))
+
+    def wait_trace(self, rec: RequestRecord, timeout: float = 3.0) -> bool:
+        """等各节点把埋点报回来。
+
+        `release` 是 fire-and-forget 的，埋点跟在它后面回来，所以完成事件
+        （`rec.done`）比埋点早到。要看时序报告就得显式等一下 —— 但**不能**让
+        请求的完成去等它，那会把控制面的往返算进用户看到的时延里。
+        """
+        want = set(self.expected_trace_nodes(rec))
+        end = time.perf_counter() + timeout
+        while time.perf_counter() < end:
+            if want <= set(rec.traces):
+                return True
+            time.sleep(0.02)
+        return want <= set(rec.traces)
+
     def _finish(self, rec: RequestRecord) -> None:
+        if rec.finished:
+            return
+        rec.finished = True
+        if rec._detok is not None:
+            # 收尾把攒着的半个字符吐出来 —— 截断在多字节字符中间时会有
+            tail = rec._detok.flush()
+            if tail:
+                rec.text += tail
+                if self.on_text:
+                    self.on_text(rec, tail)
         rec.log(f"完成 {len(rec.tokens)} 个 token，释放前后段")
         for sid in (rec.front, rec.back):
             for n in self.seg_nodes.get(sid, []):
                 self.pool.send(n, {"type": "release", "req": rec.req}, delay=False)
         rec.done.set()
         # 归还：若有请求在排队，直接交给队首（「重新进入可用池，等待下一个 request」）
-        if rec.back:
+        # 静态模式下前后段是一体的，归还前段即等于归还整条通道。
+        if rec.back and not self.static:
             self._release_back(rec.task, rec.back)
         self._release_front(rec.front)
 
@@ -391,20 +584,37 @@ class LocalCluster:
     def __init__(
         self,
         manifest: DeploymentManifest,
-        model_cfg: ToyMoEConfig,
+        model_cfg: ToyMoEConfig | None,
         links: LinkTable,
-        classifier: HistogramClassifier,
+        classifier: HistogramClassifier | None = None,
         *,
-        baselines: Mapping[str, float],
-        priors: Mapping[str, float],
+        baselines: Mapping[str, float] | None = None,
+        priors: Mapping[str, float] | None = None,
         alarm_factor: float = 5.0,
+        static_wiring: Mapping[str, tuple[str, str]] | None = None,
+        backend: str = "numpy",
+        model_dir: str | None = None,
+        model_hf: Mapping | None = None,
+        device: str = "cpu",
+        miss_policy: str = "drop",
+        textio: TextIO | None = None,
+        on_text=None,
     ):
         self.man = manifest
         self.mcfg = model_cfg
         self.links = links
         self.clf = classifier
-        self.coord = Coordinator(manifest, baselines=baselines, priors=priors,
-                                 alarm_factor=alarm_factor)
+        self.backend = backend
+        self.model_dir = model_dir
+        self.model_hf = dict(model_hf or {})
+        self.device = device
+        self.miss_policy = miss_policy
+        self.static_wiring = dict(static_wiring or {})
+        self.textio = textio
+        self.coord = Coordinator(manifest, baselines=baselines or {}, priors=priors or {},
+                                 alarm_factor=alarm_factor,
+                                 static_wiring=static_wiring,
+                                 textio=textio, on_text=on_text)
         self.procs: list[mp.Process] = []
         self.ports: dict[str, int] = {}
         self.pool: PeerPool | None = None
@@ -449,6 +659,15 @@ class LocalCluster:
             chain = by_seg[p.segment]
             i = p.position
             role = "front" if p.role.startswith("front") else p.role
+            is_back = role.startswith("back")
+            task = (role.split(":", 1)[1] if is_back
+                    else (self.static_wiring.get(p.segment, (None, None))[1]))
+            # 静态模式：前段的 tail 在配置期就知道自己该发给哪个后段 head
+            peer = None
+            if self.static_wiring and role == "front" and p.is_tail:
+                wired = self.static_wiring.get(p.segment)
+                if wired:
+                    peer = self.man.segments[wired[0]]["head"]
             cfg = NodeConfig(
                 node_id=p.node,
                 role=role,
@@ -461,8 +680,22 @@ class LocalCluster:
                 peers=peers,
                 links=self.links.to_dict(),
                 coordinator=coord_addr,
-                model=dict(self.mcfg.__dict__),
-                classifier=self.clf.to_wire() if (role == "front" and p.is_tail) else None,
+                model=(dict(self.mcfg.__dict__) if self.backend == "numpy"
+                       else dict(self.model_hf)),
+                classifier=(self.clf.to_wire()
+                            if (self.clf is not None and role == "front"
+                                and p.is_tail and not self.static_wiring)
+                            else None),
+                static_peer=peer,
+                static_task=task,
+                backend=self.backend,
+                model_dir=self.model_dir,
+                device=self.device,
+                with_embed=(role == "front" and p.is_head),
+                with_lm_head=(is_back and p.is_tail),
+                miss_policy=self.miss_policy,
+                stop_ids=(sorted(self.textio.stop.ids)
+                          if (self.textio and is_back and p.is_tail) else []),
             )
             rpc(peers[p.node], {"type": "configure", "config": cfg.to_dict()}, timeout=120)
 

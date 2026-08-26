@@ -223,11 +223,76 @@ WantedBy=multi-user.target
 
 
 # --------------------------------------------------------------------------- #
+def _fetch_all(hosts, args) -> int:
+    """让每台节点**自己**去拉它那一份权重。
+
+    为什么是各节点自己拉而不是控制机拉了再分发：控制机的上行是单点，15 台机器
+    从它这里拿等于把并行的下载串行化了。各节点直连上游（或镜像），带宽是加起来的。
+
+    清单**不**推过去 —— 各节点只需要知道自己那一份，而 `--node` 加上清单里的
+    条目就够了。所以清单文件得在各节点上能读到（跟代码一起 rsync 过去即可）。
+    """
+    if not args.plan:
+        print("fetch 需要 --plan（部署清单）")
+        return 2
+    if not (args.repo or args.endpoint):
+        print("fetch 需要 --repo（或自建源的 --endpoint）")
+        return 2
+    out = args.out or "/data/p2pmoe-weights"
+
+    def cmd_for(h) -> str:
+        parts = [args.python, "-m", "p2pmoe.deploy.fetch",
+                 "--plan", str(args.plan), "--node", h.node_id,
+                 "--out", f"{out}/{h.node_id}" if args.per_node_dir else out,
+                 "--mode", args.mode]
+        if args.repo:
+            parts += ["--repo", args.repo, "--revision", args.revision]
+        if args.endpoint:
+            parts += ["--endpoint", args.endpoint]
+        return " ".join(parts)
+
+    if args.dry_run:
+        for h in hosts:
+            print(f"  {h.node_id:<8} {cmd_for(h)}")
+        return 0
+
+    def run_one(h):
+        try:
+            if args.local:
+                import subprocess
+                r = subprocess.run(cmd_for(h), shell=True, cwd=args.workdir,
+                                   capture_output=True, text=True)
+                return h, r.returncode == 0, (r.stdout or r.stderr).strip()[-200:]
+            full = f"cd {shlex.quote(args.workdir)} && {cmd_for(h)}"
+            return (h, *_ssh(h, full, ssh=args.ssh, user=args.user))
+        except Exception as e:
+            return h, False, f"{type(e).__name__}: {e}"[:200]
+
+    # 各节点并行拉 —— 这正是不经控制机中转的意义
+    with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+        rows = list(ex.map(run_one, hosts))
+    n_ok = 0
+    for h, ok, msg in rows:
+        print(f"  {h.node_id:<8} {'✓' if ok else '✗'} {msg[-160:]}")
+        n_ok += ok
+    print(f"\nfetch: {n_ok}/{len(hosts)} 成功")
+    if n_ok == len(hosts):
+        where = f"{out}/<节点id>" if args.per_node_dir else out
+        print(f"\n各节点的权重在 {where}（每台只有自己那一份张量）")
+        if not args.per_node_dir:
+            print(f"下一步：控制器加 --model-dir {out} —— 对 15 台是同一个值，"
+                  f"因为每台机器上那个目录里装的正好是它自己要的")
+        print("提醒：这份权重是**按当时的驻留集**拉的。改了画像、覆盖率或分层之后"
+              "要重拉，否则节点加载时会报「缺 N 个 key」")
+    return 0 if n_ok == len(hosts) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="p2pmoe-launch",
                                  description="批量管理节点 agent")
     ap.add_argument("action",
-                    choices=["start", "stop", "status", "probe", "agents", "systemd"])
+                    choices=["start", "stop", "status", "probe", "agents", "systemd",
+                             "fetch"])
     ap.add_argument("--hosts", type=Path, help="hosts 文件")
     ap.add_argument("--workdir", default=".", help="各节点上代码所在目录")
     ap.add_argument("--python", default="python3")
@@ -238,6 +303,23 @@ def main(argv: list[str] | None = None) -> int:
                     help="不走 ssh，在本机执行（用于同机演练与自测）")
     ap.add_argument("--parallel", type=int, default=16)
     ap.add_argument("--k", type=int, default=8, help="probe 的采样次数")
+    # fetch 子命令用
+    ap.add_argument("--plan", type=Path, help="部署清单 JSON（fetch 用）")
+    ap.add_argument("--repo", default=None, help="HF 仓库，如 Qwen/Qwen3-30B-A3B")
+    ap.add_argument("--revision", default="main")
+    ap.add_argument("--endpoint", default=None, help="HF 镜像地址")
+    ap.add_argument("--out", default=None,
+                    help="各节点上放权重的目录。**各机同一个路径** —— "
+                         "节点 id 决定拉什么，不决定放哪，这样 --model-dir 对 "
+                         "15 台是同一个值")
+    ap.add_argument("--per-node-dir", action="store_true",
+                    help="改成 <out>/<节点id>。只在同机演练（多个 agent 在一台机器上）"
+                         "时需要，真机上别开")
+    ap.add_argument("--mode", choices=("slice", "shard"), default="slice")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只打印各节点上该跑的命令，不执行。"
+                         "**没配 ssh 就用它**：把命令拷到各机自己跑，效果一样 —— "
+                         "ssh 只是这个脚本的便利，框架本身不需要它")
     # systemd 子命令用
     ap.add_argument("--id", default="v1")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -258,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
         print(",".join(f"{h.node_id}={h.host}:{h.port}" for h in hosts))
         return 0
 
+    if args.action == "fetch":
+        return _fetch_all(hosts, args)
+
     if args.action == "probe":
         return _probe_matrix(hosts, k=args.k, parallel=args.parallel)
 
@@ -273,6 +358,14 @@ def main(argv: list[str] | None = None) -> int:
             print("离线的节点会在控制器采集能力那步被剔除，不影响其余节点 —— "
                   "分散环境下这是常态")
         return 0 if up else 1
+
+    if args.dry_run:
+        # ssh 是 launch 的便利，不是框架的依赖。打印出来自己跑，结果一模一样。
+        for h in hosts:
+            cmd = (_start_cmd(h, args.workdir, args.python, args.logdir)
+                   if args.action == "start" else _stop_cmd(h))
+            print(f"# {h.node_id} @ {h.host}\n{cmd}\n")
+        return 0
 
     def run_one(h: Host):
         try:

@@ -133,6 +133,7 @@ class TorchPartialExpertMoEBlock:
         weights: Mapping[str, "object"],
         *,
         device: str = "cpu",
+        miss_policy: str = "drop",
     ):
         import torch
 
@@ -140,6 +141,9 @@ class TorchPartialExpertMoEBlock:
         self.layer = int(layer)
         self.resident = frozenset(int(e) for e in resident)
         self.device = device
+        if miss_policy not in ("drop", "drop_noscale", "local_topk"):
+            raise ValueError(f"未知的 miss_policy {miss_policy!r}")
+        self.miss_policy = miss_policy
         if not self.resident:
             raise ValueError(f"layer {layer} 的驻留专家集为空")
 
@@ -242,35 +246,66 @@ class TorchPartialExpertMoEBlock:
 
         logits = z @ self.router.T                       # [T, E]
         probs = torch.softmax(logits.float(), dim=-1)
-        topw, topi = torch.topk(probs, c.top_k, dim=-1)  # [T, k]
+
+        # ---- 统计口径：**永远按全量路由算** ----
+        # 直方图与 miss 率必须反映「路由真正想要谁」，而不是「我们最后用了谁」。
+        # 否则画像只会不断确认已有的驻留集（`runtime/profile.py` 开头的那条前提），
+        # 通道二也会因为看不见缺失而永远不报警。这与下面用哪种补救策略无关。
+        topw, topi = torch.topk(probs, c.top_k, dim=-1)  # [T, k]，全量 top-k
         if c.norm_topk_prob:
             topw = topw / topw.sum(-1, keepdim=True)
-
         here = torch.isin(topi, self._resident_idx)       # [T, k]
-        kept = topw * here
-        denom = kept.sum(-1, keepdim=True)
-        alive = denom.squeeze(-1) > 0
-
-        # ---- drop-expert 近似（II.5）：跳过缺失专家、门控重归一 ----
-        # 文档标注它「运维近似，非无损」。miss_mass 记的就是被丢掉的门控质量。
-        renorm = torch.where(denom > 0, kept / denom.clamp_min(1e-9),
-                             torch.zeros_like(kept))
-
-        out = torch.zeros_like(z)
-        for e in sorted(self.resident):
-            sel = (topi == e) & here
-            if not sel.any():
-                continue
-            tok, slot = sel.nonzero(as_tuple=True)
-            w = renorm[tok, slot].to(z.dtype)
-            xi = z[tok]
-            hi = torch.nn.functional.silu(xi @ self._gate[e].T) * (xi @ self._up[e].T)
-            out.index_add_(0, tok, (hi @ self._down[e].T) * w[:, None])
-
         miss_tok = int((~here).any(-1).sum().item())
         miss_mass = float((topw * ~here).sum().item())
         hist = torch.zeros(c.n_experts, dtype=torch.float64, device=z.device)
         hist.index_add_(0, topi.reshape(-1), topw.reshape(-1).double())
+
+        # ---- 计算口径：缺专家时怎么补救 ----
+        if self.miss_policy == "local_topk":
+            # **在驻留集内部重新取 top-k。** 与 drop 的区别只在缺失发生时：
+            # drop 用剩下的（不足 k 个，最坏是 0 个 → 该层 FFN 输出为零）；
+            # 这里补到 k 个，把路由的第 k+1、k+2 选择拉进来。
+            #
+            # 没有缺失时两者**完全等价** —— 全量 top-k 都在驻留集里，
+            # 限制到驻留集再取 top-k 选出的是同一批。所以「驻留集覆盖实际路由
+            # 时逐位一致」这条性质在两种策略下都成立。
+            neg = torch.finfo(probs.dtype).min
+            mask = torch.zeros(c.n_experts, dtype=torch.bool, device=z.device)
+            mask[self._resident_idx] = True
+            local = probs.masked_fill(~mask[None, :], neg)
+            kk = min(c.top_k, len(self.resident))
+            use_w, use_i = torch.topk(local, kk, dim=-1)
+            use_w = use_w / use_w.sum(-1, keepdim=True).clamp_min(1e-9)
+            use_here = torch.ones_like(use_i, dtype=torch.bool)
+            alive = torch.ones(T, dtype=torch.bool, device=z.device)
+        elif self.miss_policy == "drop_noscale":
+            # 跳过缺失专家但**不重归一**：活下来的保持原权重，和 < 1。
+            # 于是这一层的 FFN 贡献按丢掉的门控质量成比例缩小 —— 缺得越多越接近
+            # 「只走残差」。重归一会把剩下那个的权重放大到 1，等于宣称
+            # 「路由本来就只想要它」，而那不是事实。
+            use_w = topw * here
+            alive = use_w.sum(-1) > 0
+            use_i, use_here = topi, here
+        else:
+            # ---- drop-expert 近似（II.5）：跳过缺失专家、门控重归一 ----
+            # 文档标注它「运维近似，非无损」。
+            kept = topw * here
+            denom = kept.sum(-1, keepdim=True)
+            alive = denom.squeeze(-1) > 0
+            use_w = torch.where(denom > 0, kept / denom.clamp_min(1e-9),
+                                torch.zeros_like(kept))
+            use_i, use_here = topi, here
+
+        out = torch.zeros_like(z)
+        for e in sorted(self.resident):
+            sel = (use_i == e) & use_here
+            if not sel.any():
+                continue
+            tok, slot = sel.nonzero(as_tuple=True)
+            w = use_w[tok, slot].to(z.dtype)
+            xi = z[tok]
+            hi = torch.nn.functional.silu(xi @ self._gate[e].T) * (xi @ self._up[e].T)
+            out.index_add_(0, tok, (hi @ self._down[e].T) * w[:, None])
 
         stats = MoEStats(
             hist=hist.cpu().numpy(),
@@ -278,7 +313,8 @@ class TorchPartialExpertMoEBlock:
             miss_token_layer=miss_tok,
             miss_mass=miss_mass,
         )
-        # top-k 全缺的 token：本层只走 attention 残差，不凭空造 FFN 输出
+        # drop 策略下 top-k 全缺的 token：本层只走 attention 残差，不凭空造 FFN
+        # 输出。local_topk 不会走到这里（它总能凑够专家），alive 恒为真。
         out = out * alive[:, None].to(out.dtype)
         return h + out, stats
 
@@ -298,12 +334,15 @@ class TorchSegmentModel:
         weights: Mapping[str, "object"],
         *,
         device: str = "cpu",
+        miss_policy: str = "drop",
     ):
         self.cfg = cfg
         self.device = device
+        self.miss_policy = miss_policy
         self.layers = sorted(int(l) for l in layer_experts)
         self.blocks = {
-            int(l): TorchPartialExpertMoEBlock(cfg, int(l), es, weights, device=device)
+            int(l): TorchPartialExpertMoEBlock(cfg, int(l), es, weights, device=device,
+                                               miss_policy=miss_policy)
             for l, es in layer_experts.items()
         }
         self.embed = weights.get("model.embed_tokens.weight")
@@ -312,6 +351,17 @@ class TorchSegmentModel:
             "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm_head.weight"
         )
         self._kv: dict[str, dict[int, dict]] = {}
+        self.profiler = None
+        """逐层激活画像的累加器。默认 None —— 见 runtime/profile.py。
+
+        能这么采是因为**路由是全量的**：`mlp.gate.weight` 每层都完整加载，
+        所以 `MoEStats.hist` 记的是 top-k 在全部 E 个专家上的分布，
+        哪怕本地只驻留了几个。"""
+
+    def enable_profiling(self) -> None:
+        from .profile import LayerProfiler
+
+        self.profiler = LayerProfiler(self.cfg.n_experts)
 
     # -- 计量 -------------------------------------------------------------- #
     @property
@@ -331,12 +381,31 @@ class TorchSegmentModel:
         idx = torch.as_tensor(list(ids), dtype=torch.long, device=self.device)
         return self.embed[idx]
 
+    def _coerce(self, x):
+        """线上来的是 float32 numpy（见 `wire._as_wire_array`），这里升回本机 dtype。
+
+        契约上 `forward` 收的是「一个 [T, d] 的数组」，不规定它是谁家的对象 ——
+        toy 版收 numpy，这一版 numpy 与 torch 都收。跨段边界两侧的 dtype 因此
+        可以不同：一台 bf16 的 GPU 节点与一台 fp32 的 CPU 节点能配成一条通道。
+        """
+        import torch
+
+        if isinstance(x, torch.Tensor):
+            return x.to(device=self.device, dtype=self.cfg.torch_dtype)
+        # copy=True：线上收来的数组由 np.frombuffer 建出，底层缓冲只读；
+        # as_tensor 直接包会让 torch 抱怨「非可写张量」并留下未定义行为的隐患
+        arr = np.array(x, dtype=np.float32, copy=True, order="C")
+        return torch.from_numpy(arr).to(device=self.device, dtype=self.cfg.torch_dtype)
+
     def forward(self, req: str, x):
+        x = self._coerce(x)
         kv = self._kv.setdefault(req, {})
         total = MoEStats.zeros(self.cfg.n_experts)
         h = x
         for l in self.layers:
             h, st = self.blocks[l].forward(h, kv.setdefault(l, {}))
+            if self.profiler is not None:
+                self.profiler.record(l, st.hist, st.n_token_layer)
             total = total.merge(st)
         return h, total
 
@@ -345,6 +414,22 @@ class TorchSegmentModel:
         if self.final_norm is None or self.lm_head is None:
             raise RuntimeError("本节点没有输出头（只有后段的 tail 需要）")
         return _rms_norm(h, self.final_norm, self.cfg.rms_eps) @ self.lm_head.T
+
+    def sample(self, h, *, temperature: float = 0.0, seed: int = 0) -> int:
+        """从最后一个位置采一个 token id。
+
+        采样放在模型这一层而不是 `node.py`，是为了守住依赖边界：node.py 属于
+        通信/协议层，它不该 import torch —— 那样 toy 模型路径也会被迫装 torch
+        （`test_requirements.py::test_heavy_deps_stay_in_the_execution_layer`）。
+        """
+        import torch
+
+        lg = self.logits(h[-1:])[0].float()
+        if temperature <= 0:
+            return int(torch.argmax(lg).item())
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        p = torch.softmax(lg.cpu() / temperature, dim=-1)
+        return int(torch.multinomial(p, 1, generator=g).item())
 
     # -- KV 生命周期 -------------------------------------------------------- #
     def drop_kv(self, req: str) -> bool:

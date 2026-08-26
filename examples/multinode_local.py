@@ -62,8 +62,14 @@ def main() -> int:
     ap.add_argument("--no-emulate-wan", dest="emulate_wan", action="store_false")
     ap.add_argument("--bad-frac", type=float, default=0.2,
                     help="劣质接入节点的比例 —— 异类入口诊断要靠它才有戏演")
+    ap.add_argument("--static", action="store_true",
+                    help="走静态简化模式（前段装全集、配对离线定死）")
     ap.add_argument("--keep-logs", action="store_true")
-    args = ap.parse_args()
+    # 没认出来的参数原样转给控制器 —— --model-dir / --wiring / --prompt 这些
+    # 是控制器的事，这里不重复声明一遍（每加一个都要改两处，迟早对不上）
+    args, passthrough = ap.parse_known_args()
+    if passthrough:
+        print(f"转给控制器的参数：{' '.join(passthrough)}")
 
     ids = [f"n{i+1}" for i in range(args.nodes)]
     ports = {i: free_port() for i in ids}
@@ -113,7 +119,8 @@ def main() -> int:
             [sys.executable, "-m", "p2pmoe.deploy.control",
              "--agents", agents, "--advertise", "127.0.0.1",
              "--requests", str(args.requests), "--tokens", str(args.tokens),
-             "--once", "--save-plan", str(logdir / "plan.json")],
+             "--once", "--save-plan", str(logdir / "plan.json")]
+            + (["--static"] if args.static else []) + passthrough,
             cwd=ROOT,
         )
         print(f"\n控制器退出码 {rc}；清单存于 {logdir/'plan.json'}")

@@ -50,6 +50,10 @@ class RemoteNetworkOracle:
     k_default: int = 8
     symmetric: bool = True
     timeout: float = 30.0
+    relay: Addr | None = None
+    """给了就经中继下发探测指令。注意这时量到的是**经中继的**往返，不是两台
+    之间的真实延迟 —— 规划据此做的放置仍然自洽（它优化的就是实付延迟），
+    但别拿这些数字去推断链路质量。"""
     _cache: dict = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     n_rpc: int = 0
@@ -77,7 +81,7 @@ class RemoteNetworkOracle:
             reply = rpc(
                 self.addrs[src],
                 {"type": "probe", "peer": dst, "addr": list(self.addrs[dst]), "k": k},
-                timeout=self.timeout,
+                timeout=self.timeout, relay=self.relay, to=src,
             )
             self.n_rpc += 1
         except Exception as e:  # 控制器连不上该 agent

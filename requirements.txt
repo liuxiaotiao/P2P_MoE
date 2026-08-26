@@ -29,7 +29,12 @@
 #                  只 materialize 需要的张量）。但那也可以用 torch 的 meta device
 #                  直接做。落地时再决定，不预先写进依赖。
 #
-# 而且这些**只有跑推理的节点**需要 —— 控制机（跑规划、探测、下发）仍然只要 numpy。
-# 到时候应该拆成 requirements.txt（控制机）+ requirements-node.txt（推理节点）。
+# 依赖已经按机器角色分成三份，互不包含：
+#
+#   requirements.txt          numpy                 两边都要（本文件）
+#   requirements-control.txt  + tokenizers、jinja2   控制机：文本进出
+#   requirements-node.txt     + torch、safetensors   推理节点：张量
+#
+# 控制机不碰张量，节点不碰文本。`test_requirements.py` 守着这条线。
 
 numpy>=1.24        # 已在 numpy 2.x 上验证（开发用 2.4.4，实测机 2.2.6）

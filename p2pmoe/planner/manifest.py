@@ -143,26 +143,7 @@ class DeploymentManifest:
             "model": self.model,
             "l0": self.l0,
             "band": {"w_lo": self.band[0], "w_hi": self.band[1]},
-            "nodes": [
-                {
-                    "node": p.node,
-                    "role": p.role,
-                    "segment": p.segment,
-                    "position": p.position,
-                    "is_head": p.is_head,
-                    "is_tail": p.is_tail,
-                    "layer_range": list(p.layer_range),
-                    "weight_gb": round(p.weight_gb, 4),
-                    "kv_gb": round(p.kv_gb, 4),
-                    "total_gb": round(p.total_gb, 4),
-                    "layers": [
-                        {"layer": l.layer, "experts": list(l.experts),
-                         "weight_gb": round(l.weight_gb, 4)}
-                        for l in p.layers
-                    ],
-                }
-                for p in self.nodes
-            ],
+            "nodes": [_node_dict(p) for p in self.nodes],
             "segments": self.segments,
             "pairings": [
                 {
@@ -181,8 +162,87 @@ class DeploymentManifest:
     def to_json(self, **kw) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2, **kw)
 
+    # -- 反序列化 ---------------------------------------------------------- #
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "DeploymentManifest":
+        """从存下来的清单还原 —— 让部署可以**不重新规划**就重放。
+
+        规划的输入里有一项是不可复现的：逐对延迟实测。同一个池子换个时间跑，
+        探测值会变，段的构成与 id 编号都可能跟着变。于是「我要 F0 连 BX1」
+        这种指定在下一次规划里可能指到别的东西上。
+
+        存清单 → 改连接 → 载清单，这条路把放置固定住，人工指定的连接才有稳定
+        的所指。代价是这份清单反映的是**当时**的网络与节点集合；机器换了或
+        链路劣化了要重跑规划。
+        """
+        nodes = [
+            NodePlan(
+                node=p["node"], role=p["role"], segment=p["segment"],
+                position=int(p["position"]),
+                is_head=bool(p["is_head"]), is_tail=bool(p["is_tail"]),
+                layers=tuple(
+                    LayerLoad(layer=int(l["layer"]), experts=tuple(l["experts"]),
+                              weight_gb=float(l["weight_gb"]),
+                              kv_gb=float(l.get("kv_gb", 0.0)))
+                    for l in p["layers"]
+                ),
+            )
+            for p in d["nodes"]
+        ]
+        pairings = [
+            Pairing(front=q["front"], back=q["back"], task=q["task"],
+                    forward=tuple(q["forward"]), loop=tuple(q["loop"]),
+                    w_p50=float(q["w_p50"]), w_p95=float(q.get("w_p95", 0.0)),
+                    w_jitter=float(q.get("w_jitter", 0.0)),
+                    d_loop_p50=float(q["d_loop_p50"]),
+                    d_loop_jitter=float(q.get("d_loop_jitter", 0.0)),
+                    t50=float(q["t50"]))
+            for q in d.get("pairings", [])
+        ]
+        band = d.get("band", {})
+        return cls(
+            model=d["model"], l0=int(d["l0"]), nodes=nodes,
+            segments=dict(d["segments"]), pairings=pairings,
+            band=(float(band.get("w_lo", 0.0)), float(band.get("w_hi", 0.0))),
+            standby_fronts=list(d.get("standby_fronts", [])),
+            violations=list(d.get("violations", [])),
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "DeploymentManifest":
+        return cls.from_dict(json.loads(text))
+
 
 # --------------------------------------------------------------------------- #
+_ND = 6
+
+
+def _node_dict(p: "NodePlan") -> dict:
+    """逐节点的 JSON。
+
+    **逐节点的三个合计值由已经四舍五入过的逐层值加出来**，不是把精确合计再舍入。
+    两种算法在最后一位上会差 1e-6，于是「导出 → 载入 → 再导出」得不到同一份
+    文件，`--load-plan` 的可重放性就成了一句空话。以读者能复算的口径为准。
+    """
+    layers = [
+        {"layer": l.layer, "experts": list(l.experts),
+         "weight_gb": round(l.weight_gb, _ND),
+         # KV 也要落盘：逐节点的 total_gb 是由逐层数据算出来的，少了它
+         # from_dict 还原出来的清单对不上原来的账
+         "kv_gb": round(l.kv_gb, _ND)}
+        for l in p.layers
+    ]
+    w = round(sum(x["weight_gb"] for x in layers), _ND)
+    kv = round(sum(x["kv_gb"] for x in layers), _ND)
+    return {
+        "node": p.node, "role": p.role, "segment": p.segment,
+        "position": p.position, "is_head": p.is_head, "is_tail": p.is_tail,
+        "layer_range": list(p.layer_range),
+        "weight_gb": w, "kv_gb": kv, "total_gb": round(w + kv, _ND),
+        "layers": layers,
+    }
+
+
 def _layer_loads(
     seg: Segment,
     idx: int,
