@@ -457,21 +457,64 @@ def main(argv: list[str] | None = None) -> int:
             log.error("  注意 15 台节点上这个路径要**一致** —— 清单按同一个 "
                       "--model-dir 下发。")
             return 2
-        got, miss = [], []
+        got: list[str] = []
+        absent: list[str] = []               # 仓库里确实没有（404）
+        failed: list[tuple[str, str]] = []   # 有，但没取下来 —— 完全是另一回事
         for f in TOKENIZER_FILES:
             try:
-                (args.out / f).write_bytes(src.read(f))
+                # tokenizer.json 是这批里唯一的大文件（真模型上约 11MB），
+                # 也是唯一会因为超时而失败的。重试两次 —— 比让人重跑整条命令便宜。
+                last: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        (args.out / f).write_bytes(src.read(f))
+                        last = None
+                        break
+                    except (urllib.error.HTTPError, FileNotFoundError):
+                        raise      # 404 / 本地真的没这个文件 —— 重试只是白等
+                    except (urllib.error.URLError, TimeoutError, OSError) as e:
+                        last = e
+                        if attempt < 2:
+                            log.info("  %s 第 %d 次失败（%s），重试…",
+                                     f, attempt + 1, type(e).__name__)
+                            time.sleep(1.5 * (attempt + 1))
+                if last is not None:
+                    raise last
                 got.append(f)
-            except Exception:
-                miss.append(f)      # generation_config 之类不是每个仓库都有
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    absent.append(f)
+                else:
+                    failed.append((f, f"HTTP {e.code}"))
+            except FileNotFoundError:
+                absent.append(f)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                failed.append((f, f"{type(e).__name__}: {e}"))
         n = sum((args.out / f).stat().st_size for f in got)
         log.info("元数据 → %s（%d 个文件，%.1f MB）", args.out, len(got), n / 1e6)
         log.info("  %s", ", ".join(got))
-        if miss:
-            log.info("  仓库里没有：%s（多数情况无所谓）", ", ".join(miss))
-        if "config.json" not in got:
-            log.error("config.json 没取到 —— 控制机没它算不了模型规格")
+        if absent:
+            log.info("  仓库里没有：%s", ", ".join(absent))
+
+        # 「仓库里没有」与「下载失败」必须分开报。混成一句的话，一次网络抖动
+        # 看起来会像「这个仓库就是没有 tokenizer」—— 而那个错要到几步之后
+        # （--chat 渲染模板、prompt 编码）才发作，到时候没人会想到是这里丢的。
+        if failed:
+            log.error("这些文件**取失败了**（不是仓库里没有）：")
+            for f, why in failed:
+                log.error("    %s —— %s", f, why)
+            log.error("  重跑一次；持续失败试 HF_ENDPOINT=https://hf-mirror.com")
+
+        need = {"config.json": "控制机没它算不了模型规格",
+                "tokenizer.json": "控制机没它没法把 prompt 编成 id、把 id 解回文本"}
+        lack = [(f, why) for f, why in need.items() if f not in got]
+        if lack:
+            for f, why in lack:
+                log.error("✗ 缺 %s —— %s", f, why)
             return 2
+        if "tokenizer_config.json" not in got:
+            log.warning("没有 tokenizer_config.json —— --chat 套不了对话模板，"
+                        "指令模型的输出会像坏了")
         log.info("控制机的 --model-dir 指到这里即可。**这里没有权重**，"
                  "节点上的同名目录才有。")
         return 0

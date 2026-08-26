@@ -91,3 +91,64 @@ def test_a_missing_model_dir_points_at_meta_not_at_refetching_weights() -> None:
     msg = r.stdout + r.stderr
     assert "meta" in msg
     assert "不要权重" in msg
+
+
+# --------------------------------------------------------------------------- #
+# 「仓库里没有」与「取失败了」是两回事
+# --------------------------------------------------------------------------- #
+def test_a_missing_tokenizer_is_a_hard_failure(ckpt, tmp_path) -> None:
+    """没有 tokenizer.json，控制机编不了 prompt、解不了 token。
+
+    以前这里只是打一句「多数情况无所谓」然后 rc=0 —— 而真正的错要到几步之后
+    才发作（--chat 渲染模板时），到时候没人会想到是取元数据那步丢的。
+    """
+    import shutil
+
+    bad = tmp_path / "ck"
+    shutil.copytree(ckpt, bad)
+    (bad / "tokenizer.json").unlink()
+    r = _fetch("--meta-only", "--src", str(bad), "--out", str(tmp_path / "m"))
+    assert r.returncode != 0
+    assert "tokenizer.json" in (r.stdout + r.stderr)
+
+
+def test_a_transient_error_is_retried(ckpt, tmp_path, monkeypatch) -> None:
+    """11MB 的 tokenizer.json 是这批里唯一会超时的。重试比让人重跑整条命令便宜。"""
+    import urllib.error
+
+    import p2pmoe.deploy.fetch as F
+
+    n = {"c": 0}
+    real = F.Source.read
+
+    def flaky(self, name, start=None, end=None):
+        if name == "tokenizer.json":
+            n["c"] += 1
+            if n["c"] < 3:
+                raise urllib.error.URLError("timed out")
+        return real(self, name, start, end)
+
+    monkeypatch.setattr(F.Source, "read", flaky)
+    monkeypatch.setattr(F.time, "sleep", lambda *_: None)
+    out = tmp_path / "m"
+    assert F.main(["--meta-only", "--src", str(ckpt), "--out", str(out)]) == 0
+    assert n["c"] == 3, "该重试到成功"
+    assert (out / "tokenizer.json").exists()
+
+
+def test_a_file_that_truly_is_absent_is_not_retried(ckpt, tmp_path, monkeypatch) -> None:
+    """真缺的文件重试只是白等 —— 而等待会被误读成「网络很慢」。"""
+    import p2pmoe.deploy.fetch as F
+
+    n = {"c": 0}
+    real = F.Source.read
+
+    def count(self, name, start=None, end=None):
+        if name == "special_tokens_map.json":
+            n["c"] += 1
+        return real(self, name, start, end)
+
+    monkeypatch.setattr(F.Source, "read", count)
+    monkeypatch.setattr(F.time, "sleep", lambda *_: None)
+    F.main(["--meta-only", "--src", str(ckpt), "--out", str(tmp_path / "m")])
+    assert n["c"] == 1, f"真缺的文件试了 {n['c']} 次"
