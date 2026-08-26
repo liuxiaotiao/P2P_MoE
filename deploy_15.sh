@@ -43,6 +43,10 @@ REQUESTS=${REQUESTS:-20}
 # ---------------------------------------------------------------------------
 
 PY=${PY:-python3}
+# ssh 相关：SSH_USER=ubuntu 或 SSH_OPTS="-i ~/.ssh/pool.pem -p 2222"
+SSHARG=()
+[ -n "${SSH_USER:-}" ] && SSHARG+=(--user "$SSH_USER")
+[ -n "${SSH_OPTS:-}" ] && SSHARG+=(--ssh "ssh -o BatchMode=yes -o ConnectTimeout=10 $SSH_OPTS")
 AGENTS() { $PY -m p2pmoe.deploy.launch agents --hosts "$HOSTS"; }
 say() { printf '\n\033[1m══ %s\033[0m\n' "$*"; }
 need() { [ -f "$1" ] || { echo "缺文件：$1"; exit 1; }; }
@@ -163,13 +167,13 @@ cmd_sync() {
   hosts=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]}' "$HOSTS")
   for h in $hosts; do
     echo "  → $h"
-    ssh -o BatchMode=yes "${SSH_USER:+$SSH_USER@}$h" \
+    ssh -o BatchMode=yes ${SSH_OPTS:-} "${SSH_USER:+$SSH_USER@}$h" \
         "mkdir -p '$WORKDIR' '$WEIGHTS'" </dev/null
-    rsync -az --delete \
+    rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
       --exclude '__pycache__' --exclude '.git' --exclude 'task' \
       --exclude '*.pyc' --exclude '.pytest_cache' --exclude '.*-logs' \
       ./ "${SSH_USER:+$SSH_USER@}$h:$WORKDIR/"
-    ssh -o BatchMode=yes "${SSH_USER:+$SSH_USER@}$h" \
+    ssh -o BatchMode=yes ${SSH_OPTS:-} "${SSH_USER:+$SSH_USER@}$h" \
         "cd '$WORKDIR' && $PY -m pip install -q -r requirements-node.txt" </dev/null
   done
   echo "  ✓ 15 台都有代码与 torch/safetensors"
@@ -191,34 +195,51 @@ print(f"  清单：L₀={m['l0']}，{len(nodes)} 台，{len(m['segments'])} 条�
 for sid, s in sorted(m["segments"].items()):
     print(f"    {sid:<16}{s['role']:<16}{s['nodes']}")
 PYEOF
-  say "1. 节点在线与两两可达"
-  $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS" || true
+  say "1. ssh 可达（BatchMode：必须免密，密码提示会挂住）"
+  # 并行探 —— 串行 15 台 × 10s 超时要等两分半，而这只是个前置检查
+  local d; d=$(mktemp -d)
+  for h in $(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]}' "$HOSTS"); do
+    ( ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+          "${SSH_USER:+$SSH_USER@}$h" true </dev/null 2>/dev/null \
+        && echo ok > "$d/$h" || echo no > "$d/$h" ) &
+  done
+  wait
+  local bad=0
+  for h in $(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]}' "$HOSTS"); do
+    if [ "$(cat "$d/$h" 2>/dev/null)" = ok ]; then printf '  ✓ %s\n' "$h"
+    else printf '  ✗ %s  —— 免密没配好，或用户/端口不对\n' "$h"; bad=$((bad+1)); fi
+  done
+  rm -rf "$d"
+  [ "$bad" -eq 0 ] || echo "  （$bad 台不通。改用 ./deploy_15.sh bootstrap 走无 ssh 那条路）"
+
+  say "2. 节点在线与两两可达"
+  $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS" "${SSHARG[@]}" || true
   echo "  —— 数据面是节点**直接互发**，控制机不在中间。下面查两两可达："
-  $PY -m p2pmoe.deploy.launch probe --hosts "$HOSTS" --k 8 || true
+  $PY -m p2pmoe.deploy.launch probe --hosts "$HOSTS" --k 8 "${SSHARG[@]}" || true
 }
 
 cmd_fetch() {
-  say "2. 各节点只拉自己那份权重"
+  say "3. 各节点只拉自己那份权重"
   echo "  合计约 141GB（全模型 160GB × 15 台 = 2400GB，省 94%）"
   echo "  先看会下多少："
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" --dry-run
+      --repo "$REPO" --out "$WEIGHTS" "${SSHARG[@]}" --dry-run
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
+      --repo "$REPO" --out "$WEIGHTS" "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }
 
 cmd_start() {
-  say "3. 起 agent"
-  $PY -m p2pmoe.deploy.launch start --hosts "$HOSTS" --workdir "$WORKDIR"
+  say "4. 起 agent"
+  $PY -m p2pmoe.deploy.launch start --hosts "$HOSTS" --workdir "$WORKDIR" "${SSHARG[@]}"
   sleep 5
-  $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS"
+  $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS" "${SSHARG[@]}"
 }
 
 # 动态模式：请求随机到达任意前段 → 前段本地识别 task → 派发到该 task 的后段。
 # **不加 --static** —— 静态配对下一条前段绑死一个 task，随机来的请求接不住。
 cmd_serve() {
-  say "4. 建链 + 服务（动态：盲绑 → 识别 → 派发）"
+  say "5. 建链 + 服务（动态：盲绑 → 识别 → 派发）"
   $PY -m p2pmoe.deploy.control \
       --agents "$(AGENTS)" --advertise "$ADVERTISE" \
       --load-plan "$PLAN" \
@@ -229,12 +250,12 @@ cmd_serve() {
 }
 
 cmd_measure() {
-  say "4'. 服务 + 逐请求时序"
+  say "5'. 服务 + 逐请求时序"
   echo "  --warmup 不是可选的：torch 首次前向含 kernel 选择，不预热量到的是冷启动"
   cmd_serve --verbose
 }
 
-cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS"; }
+cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
 
 case "${1:-all}" in
   sync)      cmd_sync ;;
