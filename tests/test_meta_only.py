@@ -152,3 +152,72 @@ def test_a_file_that_truly_is_absent_is_not_retried(ckpt, tmp_path, monkeypatch)
     monkeypatch.setattr(F.time, "sleep", lambda *_: None)
     F.main(["--meta-only", "--src", str(ckpt), "--out", str(tmp_path / "m")])
     assert n["c"] == 1, f"真缺的文件试了 {n['c']} 次"
+
+
+# --------------------------------------------------------------------------- #
+# 已经在本地的文件：跳过，但要验它真能用
+# --------------------------------------------------------------------------- #
+def test_an_existing_good_file_is_kept(ckpt, tmp_path) -> None:
+    """手工 curl 补上的那一个不能被覆盖 —— 在会掐断的链路上，
+    那可能是唯一一次成功。"""
+    import shutil
+
+    out = tmp_path / "m"
+    out.mkdir()
+    shutil.copy(ckpt / "tokenizer.json", out / "tokenizer.json")
+    mtime = (out / "tokenizer.json").stat().st_mtime_ns
+
+    r = _fetch("--meta-only", "--src", str(ckpt), "--out", str(out))
+    assert r.returncode == 0
+    assert (out / "tokenizer.json").stat().st_mtime_ns == mtime, "被重写了"
+    assert "已有" in (r.stdout + r.stderr)
+
+
+def test_an_html_error_page_is_not_mistaken_for_a_tokenizer(ckpt, tmp_path) -> None:
+    """**手工下载最常见的坑**：拿到的是 HTML 错误页（登录墙 / 403 / 镜像提示页）。
+    文件存在、大小非零，直到 tokenizer 加载时才炸 —— 那时离原因隔了很远。
+    """
+    out = tmp_path / "m"
+    out.mkdir()
+    (out / "tokenizer.json").write_text("<html>403 Forbidden</html>", encoding="utf-8")
+    r = _fetch("--meta-only", "--src", str(ckpt), "--out", str(out))
+    assert r.returncode == 0
+    assert "读不通" in (r.stdout + r.stderr), "没认出这不是 tokenizer"
+    import json as _json
+    back = _json.loads((out / "tokenizer.json").read_text(encoding="utf-8"))
+    assert isinstance(back.get("model"), dict), "重取之后应该是真的 tokenizer"
+
+
+def test_an_empty_file_is_refetched(ckpt, tmp_path) -> None:
+    """0 字节通常是上次下载被打断留下的残骸。"""
+    out = tmp_path / "m"
+    out.mkdir()
+    (out / "tokenizer.json").write_bytes(b"")
+    assert _fetch("--meta-only", "--src", str(ckpt), "--out", str(out)).returncode == 0
+    assert (out / "tokenizer.json").stat().st_size > 0
+
+
+def test_force_refetches_everything(ckpt, tmp_path) -> None:
+    import shutil
+
+    out = tmp_path / "m"
+    out.mkdir()
+    shutil.copy(ckpt / "tokenizer.json", out / "tokenizer.json")
+    r = _fetch("--meta-only", "--src", str(ckpt), "--out", str(out), "--force")
+    assert r.returncode == 0
+    assert "已有" not in (r.stdout + r.stderr)
+
+
+def test_a_json_that_is_not_a_tokenizer_is_refetched(ckpt, tmp_path) -> None:
+    """合法 JSON 但不是 tokenizer —— 镜像的提示页有时就长这样。"""
+    out = tmp_path / "m"
+    out.mkdir()
+    (out / "tokenizer.json").write_text('{"error":"not found"}', encoding="utf-8")
+    r = _fetch("--meta-only", "--src", str(ckpt), "--out", str(out))
+    assert "读不通" in (r.stdout + r.stderr)
+
+
+def test_validation_does_not_import_tokenizers() -> None:
+    """节点只见 token id，不该为了校验一个文件多装一套分词器。"""
+    src = (ROOT / "p2pmoe" / "deploy" / "fetch.py").read_text(encoding="utf-8")
+    assert "from tokenizers" not in src and "import tokenizers" not in src

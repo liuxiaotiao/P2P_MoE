@@ -8,6 +8,7 @@
 #   ./deploy_15.sh check      # 只检查连通性与依赖，不动任何东西
 #   ./deploy_15.sh fetch      # 各节点只拉自己那份权重（合计 141GB，不是 2400GB）
 #   ./deploy_15.sh meta       # 控制机取 config+tokenizer（10MB，不含权重）
+#   ./deploy_15.sh diag       # 源站诊断：大文件和小文件是不是两个域名
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
@@ -631,6 +632,31 @@ cmd_serve_weights() {
   $PY -m p2pmoe.deploy.serve_weights --dir "$d" --bind "0.0.0.0:${WSRC_PORT:-9400}"
 }
 
+# 源站诊断：小文件与大文件是不是同一个域名、CDN 那个域名通不通。
+#
+# 「小文件过得去、大文件过不去」有两种解释，修法完全不同：
+#   · 链路把长传输掐断（代理 / MTU / CDN 抖动）→ 调网络
+#   · **它们根本是两个域名** → 让 IT 放行第二个
+# HF 把 config.json 由 huggingface.co 直接发，LFS 文件（tokenizer.json 与全部
+# safetensors）302 到 CDN。白名单只放行前者时，症状看着完全像前一种。
+cmd_diag() {
+  say "D. 源站诊断"
+  echo "  控制机这边："
+  $PY -m p2pmoe.deploy.fetch --diagnose --repo "$REPO" \
+      ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"} 2>&1 | sed 's/^/  /'
+  local first firstip
+  first=$(awk '{sub(/#.*/,"")} NF>=2 {print $1; exit}' "$HOSTS" 2>/dev/null)
+  firstip=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]; exit}' "$HOSTS" 2>/dev/null)
+  [ -n "$firstip" ] || return 0
+  echo
+  echo "  节点 $first 那边（网络策略可能和控制机不同）："
+  ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+      "${SSH_USER:+$SSH_USER@}$firstip" \
+      "cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") -m p2pmoe.deploy.fetch \
+--diagnose --repo $(printf %q "$REPO") ${HF_ENDPOINT:+--endpoint $(printf %q "$HF_ENDPOINT")}" \
+      </dev/null 2>&1 | sed 's/^/  /' || echo "  （ssh 不通，上机自己跑）"
+}
+
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
 
 # serve / measure 后面多写的参数**原样透传给 control.py**，例如
@@ -646,6 +672,7 @@ case "$action" in
   check)   cmd_check ;;
   fetch)   cmd_fetch ;;
   meta)    cmd_meta ;;
+  diag)    cmd_diag ;;
   serve-weights) cmd_serve_weights "${1:-}" ;;
   start)   cmd_start ;;
   serve)   cmd_serve "$@" ;;
@@ -655,6 +682,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|serve-weights|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

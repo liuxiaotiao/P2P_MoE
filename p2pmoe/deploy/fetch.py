@@ -276,6 +276,126 @@ def looks_like_lfs_pointer(head: bytes) -> bool:
     return head[:len(_LFS_MAGIC)] == _LFS_MAGIC
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """把重定向拦下来，好看清它想把我们送到哪个域名去。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _Redirected(newurl)
+
+
+class _Redirected(Exception):
+    def __init__(self, url: str):
+        super().__init__(url)
+        self.url = url
+
+
+def lack_would_be_empty(got: list[str], have: list[str]) -> bool:
+    """两个必需文件都到位了 —— 有几个可选文件取失败无所谓，别做多余的诊断。"""
+    ok = set(got) | set(have)
+    return {"config.json", "tokenizer.json"} <= ok
+
+
+def _meta_file_ok(path: "Path") -> bool:
+    """本地已有的元数据文件是不是真能用。
+
+    手工下载最常见的坑不是没下到，是**下到了一个 HTML 错误页**（登录墙、
+    403、镜像的提示页），文件存在、大小也不为零，直到 tokenizer 加载时才炸。
+    这里当场验一次，比留到几步之后便宜得多。
+
+    只做**结构**检查，不 import `tokenizers` —— 这个模块跑在 15 台推理节点上，
+    而节点自始至终只见 token id，不该为了校验一个文件多装一套分词器
+    （`test_requirements.py::test_node_never_needs_a_tokenizer` 守着这条线）。
+    结构检查足够挡住 HTML 错误页，那才是要挡的东西。
+    """
+    try:
+        if not path.name.endswith(".json"):
+            return path.stat().st_size > 0
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False
+        if path.name == "tokenizer.json":
+            # HF 的 tokenizer.json 一定有 model；多数还有 added_tokens。
+            # 错误页连合法 JSON 都不是，走不到这儿。
+            return isinstance(data.get("model"), dict)
+        return True
+    except Exception:
+        return False
+
+
+def diagnose(src: Source, probe: str = "tokenizer.json") -> None:
+    """「小文件过得去、大文件过不去」的第二种解释：**它们不在同一个域名上**。
+
+    HF 把小文件（config.json、tokenizer_config.json）由 huggingface.co 直接发，
+    而 LFS 文件（tokenizer.json、所有 safetensors）**302 重定向到 CDN** ——
+    `cdn-lfs*.huggingface.co` 或 `*.xethub.hf.co`。
+
+    企业网络里常见的情形是白名单只放行了 huggingface.co，CDN 那个域名没放。
+    症状就长得像「大文件传不动」，但真正要做的不是调 MTU、不是换镜像，
+    而是让 IT 把 CDN 域名也加进去。这个函数就是把该报给 IT 的域名找出来。
+    """
+    from urllib.parse import urlsplit
+
+    if src.local is not None:
+        log.info("  本地源，无需诊断网络")
+        return
+
+    log.info("  ── 源站诊断 ──")
+    base_host = urlsplit(src.base).netloc
+
+    # 1. 小文件：走不走得通 base 这个域名
+    try:
+        src.read("config.json")
+        log.info("  ✓ %s 可达（config.json 取到了）", base_host)
+    except Exception as e:
+        log.error("  ✗ %s 不可达：%s", base_host, e)
+        log.error("    连主域名都不通 —— 先查代理与 DNS，别往下看了。")
+        return
+
+    # 2. 大文件被重定向到哪儿
+    op = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(f"{src.base}/{probe}", method="HEAD")
+    if src.token:
+        req.add_header("Authorization", f"Bearer {src.token}")
+    target = None
+    try:
+        op.open(req, timeout=src.timeout)
+        log.info("  · %s 没有重定向 —— 与小文件同一个域名", probe)
+    except _Redirected as r:
+        target = r.url
+        log.info("  · %s → 重定向到 %s", probe, urlsplit(target).netloc)
+    except Exception as e:
+        log.info("  · 问不出 %s 的重定向目标（%s）", probe, type(e).__name__)
+
+    if not target:
+        log.error("  大文件和小文件在同一个域名上，那不是域名的问题 —— "
+                  "回去查代理 / MTU / CDN 抖动。")
+        return
+
+    # 3. 那个域名连不连得上
+    host = urlsplit(target).netloc
+    try:
+        r2 = urllib.request.Request(target)
+        with urllib.request.urlopen(r2, timeout=src.timeout) as resp:
+            resp.read(65536)
+        log.info("  ✓ %s 也可达 —— 域名不是原因", host)
+    except Exception as e:
+        log.error("  ✗ **%s 连不上**：%s", host, e)
+        log.error("")
+        log.error("  这就是原因：小文件由 %s 直接发，", base_host)
+        log.error("  而 LFS 文件（tokenizer.json 与**全部 safetensors**）"
+                  "重定向到 %s。", host)
+        log.error("  企业网络的白名单常常只放行了前者。")
+        log.error("")
+        log.error("  要 IT 放行的域名：")
+        log.error("      %s", base_host)
+        log.error("      %s", host)
+        log.error("      （HF 的 CDN 还会用 cdn-lfs*.huggingface.co、"
+                  "*.xethub.hf.co，一并放行）")
+        log.error("")
+        log.error("  等不及的话：在一台能连上 %s 的机器上下全量，", host)
+        log.error("  再用 ./deploy_15.sh serve-weights 从局域网发给 15 台。")
+
+
 def read_header(src: Source, shard: str) -> tuple[dict, int]:
     """读 safetensors 的文件头。返回 (头 JSON, 数据段起始偏移)。
 
@@ -510,7 +630,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="部署清单 JSON（--meta-only 时不需要）")
     ap.add_argument("--node", default=None,
                     help="本机在清单里的节点 id（--meta-only 时不需要）")
-    ap.add_argument("--out", type=Path, required=True, help="拼好的 checkpoint 放哪")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="拼好的 checkpoint 放哪（--diagnose 时不需要）")
     ap.add_argument("--mode", choices=("slice", "shard"), default="slice",
                     help="slice=逐张量（省得多，要 Range 支持）；shard=整分片（兜底）")
     ap.add_argument("--gap-mb", type=float, default=1.0,
@@ -521,6 +642,11 @@ def main(argv: list[str] | None = None) -> int:
                          "读 tokenizer 编解码文本。给它 141GB 权重是浪费")
     ap.add_argument("--no-tokenizer", action="store_true",
                     help="不取 tokenizer（节点其实用不到，默认取是为了目录自洽）")
+    ap.add_argument("--force", action="store_true",
+                    help="--meta-only 时重取已存在的文件（默认跳过）")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="只做源站诊断：小文件与大文件是不是同一个域名、"
+                         "CDN 那个域名通不通。企业白名单漏放 CDN 时用它定位")
     ap.add_argument("--dry-run", action="store_true", help="只算要下多少，不下")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
@@ -529,11 +655,19 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(message)s")
     src = Source(repo=args.repo, revision=args.revision, base_url=args.base_url,
                  local=args.src, endpoint=args.endpoint)
-    if not args.meta_only and not (args.plan and args.node):
+    if not args.diagnose and args.out is None:
+        ap.error("要给 --out")
+    if not (args.meta_only or args.diagnose) and not (args.plan and args.node):
         ap.error("要么给 --plan 与 --node（拉本机那份权重），"
-                 "要么给 --meta-only（只拉 config 与 tokenizer）")
+                 "要么给 --meta-only（只拉 config 与 tokenizer）"
+                 "或 --diagnose（只诊断源站）")
     man = (DeploymentManifest.from_json(args.plan.read_text(encoding="utf-8"))
            if args.plan else None)
+
+    # --diagnose 要在读 config 之前 —— 读不到 config 恰恰是它要诊断的情形之一
+    if args.diagnose:
+        diagnose(src)
+        return 0
 
     try:
         cfg = src.read_json("config.json")
@@ -561,9 +695,20 @@ def main(argv: list[str] | None = None) -> int:
                       "--model-dir 下发。")
             return 2
         got: list[str] = []
+        have: list[str] = []                 # 已经在本地了，跳过
         absent: list[str] = []               # 仓库里确实没有（404）
         failed: list[tuple[str, str]] = []   # 有，但没取下来 —— 完全是另一回事
         for f in TOKENIZER_FILES:
+            # 已经有了就不重取。手工 curl 补上的那一个尤其不能被覆盖 ——
+            # 在会掐断的链路上，那可能是唯一一次成功。
+            cur = args.out / f
+            if not args.force and cur.exists() and cur.stat().st_size > 0:
+                if _meta_file_ok(cur):
+                    have.append(f)
+                    continue
+                log.warning("  %s 已存在但读不通（%d 字节）—— 重取。"
+                            "手工下载常见的坑：拿到的是错误页而不是文件。",
+                            f, cur.stat().st_size)
             try:
                 # tokenizer.json 是这批里唯一的大文件（真模型上约 11MB），
                 # 也是唯一会因为超时而失败的。重试两次 —— 比让人重跑整条命令便宜。
@@ -593,9 +738,13 @@ def main(argv: list[str] | None = None) -> int:
                 absent.append(f)
             except (urllib.error.URLError, OSError, ValueError) as e:
                 failed.append((f, f"{type(e).__name__}: {e}"))
-        n = sum((args.out / f).stat().st_size for f in got)
-        log.info("元数据 → %s（%d 个文件，%.1f MB）", args.out, len(got), n / 1e6)
-        log.info("  %s", ", ".join(got))
+        n = sum((args.out / f).stat().st_size for f in got + have)
+        log.info("元数据 → %s（%d 个文件，%.1f MB）",
+                 args.out, len(got) + len(have), n / 1e6)
+        if got:
+            log.info("  取到：%s", ", ".join(got))
+        if have:
+            log.info("  已有（跳过，--force 可强制重取）：%s", ", ".join(have))
         if absent:
             log.info("  仓库里没有：%s", ", ".join(absent))
 
@@ -635,14 +784,21 @@ def main(argv: list[str] | None = None) -> int:
             log.error("          %s/tokenizer.json", src.base)
             log.error("      # 或者已有全量 checkpoint：--src <目录>")
 
+        if failed and not lack_would_be_empty(got, have):
+            try:
+                diagnose(src)
+            except Exception as e:                  # 诊断本身不能盖住原始错误
+                log.debug("诊断失败：%s", e)
+
         need = {"config.json": "控制机没它算不了模型规格",
                 "tokenizer.json": "控制机没它没法把 prompt 编成 id、把 id 解回文本"}
-        lack = [(f, why) for f, why in need.items() if f not in got]
+        ok_set = set(got) | set(have)
+        lack = [(f, why) for f, why in need.items() if f not in ok_set]
         if lack:
             for f, why in lack:
                 log.error("✗ 缺 %s —— %s", f, why)
             return 2
-        if "tokenizer_config.json" not in got:
+        if "tokenizer_config.json" not in ok_set:
             log.warning("没有 tokenizer_config.json —— --chat 套不了对话模板，"
                         "指令模型的输出会像坏了")
         log.info("控制机的 --model-dir 指到这里即可。**这里没有权重**，"
