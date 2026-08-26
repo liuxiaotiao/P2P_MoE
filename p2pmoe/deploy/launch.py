@@ -276,8 +276,8 @@ def _fetch_all(hosts, args) -> int:
     if not args.plan:
         print("fetch 需要 --plan（部署清单）")
         return 2
-    if not (args.repo or args.endpoint):
-        print("fetch 需要 --repo（或自建源的 --endpoint）")
+    if not (args.repo or args.endpoint or args.base_url or args.src):
+        print("fetch 需要一个权重源：--repo / --endpoint / --base-url / --src")
         return 2
     out = args.out or "/data/p2pmoe-weights"
     _warn_default_workdir(args)
@@ -287,11 +287,19 @@ def _fetch_all(hosts, args) -> int:
                  "--plan", str(args.plan), "--node", h.node_id,
                  "--out", f"{out}/{h.node_id}" if args.per_node_dir else out,
                  "--mode", args.mode]
-        if args.repo:
-            parts += ["--repo", args.repo, "--revision", args.revision]
-        if args.endpoint:
-            parts += ["--endpoint", args.endpoint]
-        return " ".join(parts)
+        # 权重源三选一，与 fetch 的口径一致
+        if args.src:
+            parts += ["--src", args.src]
+        elif args.base_url:
+            parts += ["--base-url", args.base_url]
+        else:
+            if args.repo:
+                parts += ["--repo", args.repo, "--revision", args.revision]
+            if args.endpoint:
+                parts += ["--endpoint", args.endpoint]
+        if args.transport and args.transport != "auto":
+            parts += ["--transport", args.transport]
+        return " ".join(shlex.quote(x) for x in parts)
 
     if args.dry_run:
         # 打**真正会执行的那条**，含 `cd`。少打 cd 的代价：workdir 配错时
@@ -358,6 +366,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", default=None, help="HF 仓库，如 Qwen/Qwen3-30B-A3B")
     ap.add_argument("--revision", default="main")
     ap.add_argument("--endpoint", default=None, help="HF 镜像地址")
+    ap.add_argument("--base-url", default=None,
+                    help="任意 base URL —— 局域网权重源（serve_weights）用这个")
+    ap.add_argument("--src", default=None,
+                    help="各节点都能读到的全量 checkpoint 目录（NFS/共享盘）")
+    ap.add_argument("--transport", choices=("auto", "urllib", "curl"),
+                    default="auto",
+                    help="透传给各节点的 fetch。curl 能下而 Python 下不动时用")
     ap.add_argument("--out", default=None,
                     help="各节点上放权重的目录。**各机同一个路径** —— "
                          "节点 id 决定拉什么，不决定放哪，这样 --model-dir 对 "
