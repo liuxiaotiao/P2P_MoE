@@ -195,8 +195,24 @@ class Source:
                 stalls = 0
 
     def _have_curl(self) -> bool:
+        """PATH 里有还不够 —— 真跑一次 `curl --version`。
+
+        装了但跑不起来（缺库、权限、被壳子包住）的情况是有的，
+        而在那种情况下切过去只是把一个错换成另一个错。
+        """
         if self._curl_ok is None:
-            self._curl_ok = shutil.which("curl") is not None
+            if shutil.which("curl") is None:
+                self._curl_ok = False
+            else:
+                try:
+                    r = subprocess.run(["curl", "--version"],
+                                       capture_output=True, timeout=10)
+                    self._curl_ok = r.returncode == 0
+                    if self._curl_ok:
+                        first = r.stdout.decode(errors="replace").splitlines()[:1]
+                        log.debug("curl 可用：%s", first[0] if first else "?")
+                except Exception:
+                    self._curl_ok = False
         return self._curl_ok
 
     def _get(self, name: str, lo: int, hi: int | None, *, ranged: bool):
@@ -210,13 +226,16 @@ class Source:
                 raise
             if not self._have_curl():
                 raise
-            log.warning("urllib 取 %s 失败（%s）—— 改用 curl 重试。", name, e)
+            # **决定切的那一刻就粘住**，不是等 curl 成功之后。
+            # 放在成功之后的话，curl 本身有问题时每一次请求都会重走一遍
+            # urllib（同样的超时、同样的等待），然后打同一句话 —— 而真正的
+            # curl 报错被淹没在重复里。
+            self.transport = "curl"
+            log.warning("urllib 取 %s 失败（%s）—— 本次运行余下的请求改用 curl。",
+                        name, e)
             log.warning("  这两者用的不是同一套 TLS："
                         "conda 环境自带 OpenSSL，系统 curl 用系统的。")
-            out = self._get_curl(name, lo, hi, ranged=ranged)
-            log.warning("  curl 成功 —— **本次运行余下的请求都走 curl**。")
-            self.transport = "curl"
-            return out
+            return self._get_curl(name, lo, hi, ranged=ranged)
 
     def _get_curl(self, name: str, lo: int, hi: int | None, *, ranged: bool):
         """用 curl 取一段。`-r lo-hi` 就是 Range 头。
@@ -228,7 +247,11 @@ class Source:
             raise OSError("需要 curl，但 PATH 里没有")
         with tempfile.TemporaryDirectory() as td:
             body, hdr = Path(td) / "b", Path(td) / "h"
-            cmd = ["curl", "-sS", "-L", "--fail-with-body",
+            # 只用**很老的 curl 也有**的选项：-sS -L --max-time -D -o -r -H。
+            # 别用 --fail / --fail-with-body：前者会把错误响应体丢掉，
+            # 后者要 curl ≥ 7.76 —— 而集群里的 curl 常常比这老得多。
+            # 状态码从 -D 落下来的头文件里读，判断权留在自己手上。
+            cmd = ["curl", "-sS", "-L",
                    "--max-time", str(int(self.timeout)),
                    "-D", str(hdr), "-o", str(body)]
             if self.token:
@@ -243,16 +266,15 @@ class Source:
                      if l.startswith("HTTP/") and len(l.split()) > 1]
             status = codes[-1] if codes else 0
             if r.returncode != 0:
-                # **两条传输必须抛同一种异常。** 调用方靠 HTTPError.code 区分
-                # 「仓库里没有这个文件」（404，可选文件正常缺席）和「取失败了」；
-                # curl 这边抛 OSError 的话，404 会被当成硬错误，
-                # 一个可有可无的 special_tokens_map.json 就能让整轮下载失败。
-                if status >= 400:
-                    raise urllib.error.HTTPError(
-                        f"{self.base}/{name}", status,
-                        f"curl: HTTP {status}", None, None)
                 raise OSError(f"curl 退出码 {r.returncode}："
                               f"{r.stderr.decode(errors='replace').strip()[:200]}")
+            # **两条传输必须抛同一种异常。** 调用方靠 HTTPError.code 区分
+            # 「仓库里没有这个文件」（404，可选文件正常缺席）和「取失败了」；
+            # 这边抛 OSError 的话，一个可有可无的 special_tokens_map.json
+            # 就能让整轮下载失败。
+            if status >= 400:
+                raise urllib.error.HTTPError(
+                    f"{self.base}/{name}", status, f"HTTP {status}", None, None)
             if ranged and hi is not None and lo == 0 and status != 206:
                 raise RangeNotSupported(
                     f"{self.base} 不支持 Range 请求（请求 {name} 的一小段，"

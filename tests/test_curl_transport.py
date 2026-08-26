@@ -211,3 +211,85 @@ def test_an_optional_file_missing_does_not_kill_the_run(tmp_path, srv) -> None:
         assert list(out.glob("*.safetensors"))
     finally:
         s2.stop()
+
+
+# --------------------------------------------------------------------------- #
+# 5. 只用老 curl 也有的选项
+# --------------------------------------------------------------------------- #
+def test_no_options_that_need_a_recent_curl() -> None:
+    """真踩过：`--fail-with-body` 要 curl ≥ 7.76，集群里的常常更老。
+
+    症状很难看 —— 每次请求先等一遍 urllib 超时，再被 curl 以
+    `option --fail-with-body: is unknown` 顶回来，如此往复。
+
+    只看**真正拼进命令行的那些**，注释里提到它们是好事（说明为什么不用）。
+    """
+    import ast
+
+    src = (Path(__file__).resolve().parent.parent
+           / "p2pmoe" / "deploy" / "fetch.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    opts: set[str] = set()
+    for node in ast.walk(tree):
+        # 找 `cmd = ["curl", ...]` 与后续 `cmd += [...]`
+        if isinstance(node, (ast.List, ast.Tuple)):
+            vals = [e.value for e in node.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if any(v == "curl" for v in vals) or any(v.startswith("-") for v in vals):
+                opts |= {v for v in vals if v.startswith("-")}
+    assert opts, "找不到 curl 的命令行 —— 拼法变了？"
+    RECENT = {"--fail-with-body", "--retry-all-errors", "--json",
+              "--parallel", "--remove-on-error", "--no-clobber"}
+    assert not (opts & RECENT), f"用了较新 curl 才有的选项：{opts & RECENT}"
+
+
+def test_a_404_body_is_not_swallowed(srv) -> None:
+    """不用 --fail 的另一个理由：错误响应体有时才是真正的信息
+    （镜像的提示页、限流说明）。"""
+    import urllib.error as ue
+
+    with pytest.raises(ue.HTTPError):
+        _src(srv, "curl").read("nope.json")
+
+
+# --------------------------------------------------------------------------- #
+# 6. 切换必须在「决定切」时粘住
+# --------------------------------------------------------------------------- #
+def test_the_switch_sticks_even_if_curl_then_fails(srv, monkeypatch, caplog) -> None:
+    """**真踩过。**
+
+    原来是 curl 成功之后才把 transport 置为 curl。curl 本身有问题时，
+    每一次请求都会重走一遍 urllib（同样的超时、同样的等待），打同一句话，
+    而真正的 curl 报错被淹没在重复里 —— 日志里那句话出现了五遍。
+    """
+    s = _src(srv, "auto")
+    n = {"u": 0, "c": 0}
+
+    def bad_urllib(*a, **k):
+        n["u"] += 1
+        raise urllib.error.URLError("handshake timed out")
+
+    def bad_curl(*a, **k):
+        n["c"] += 1
+        raise OSError("curl: option --whatever: is unknown")
+
+    monkeypatch.setattr(Source, "_get_urllib", bad_urllib)
+    monkeypatch.setattr(Source, "_get_curl", bad_curl)
+    monkeypatch.setattr("p2pmoe.deploy.fetch.time.sleep", lambda *_: None)
+    with caplog.at_level("WARNING", logger="p2pmoe.fetch"):
+        with pytest.raises(OSError):
+            s.read("m.safetensors", 0, 100)
+
+    assert n["u"] == 1, f"urllib 被重试了 {n['u']} 次 —— 切换没粘住"
+    assert caplog.text.count("改用 curl") == 1, "同一句话打了多遍"
+    assert s.transport == "curl"
+
+
+def test_curl_availability_is_actually_probed(monkeypatch, tmp_path) -> None:
+    """PATH 里有还不够 —— 装了但跑不起来的情况是有的，
+    那时候切过去只是把一个错换成另一个错。"""
+    s = Source(base_url="http://127.0.0.1:1", transport="auto")
+    monkeypatch.setattr("p2pmoe.deploy.fetch.shutil.which", lambda _: "/usr/bin/curl")
+    monkeypatch.setattr("p2pmoe.deploy.fetch.subprocess.run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+    assert s._have_curl() is False
