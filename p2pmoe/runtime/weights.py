@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-__all__ = ["KeyPlan", "qwen_moe_keys", "WeightIndex", "SelectiveLoader", "LoadReport"]
+__all__ = ["qwen3_next_keys", "KeyPlan", "qwen_moe_keys", "WeightIndex", "SelectiveLoader", "LoadReport"]
 
 
 # --------------------------------------------------------------------------- #
@@ -219,3 +219,67 @@ class SelectiveLoader:
             missing=sorted(want - set(tensors)),
         )
         return tensors, report
+
+
+# --------------------------------------------------------------------------- #
+def qwen3_next_keys(plan: KeyPlan, *, layer_types: Sequence[str],
+                    shared_expert: bool = True,
+                    tie_word_embeddings: bool = False) -> set[str]:
+    """Qwen3-Next 的 key 命名 —— **逐层不同**，这是它与 Qwen3-MoE 最大的差别。
+
+    每 4 层里 3 层是 Gated DeltaNet、1 层是标准 attention（`full_attention_interval`），
+    两种层的 key 集合完全不重叠::
+
+        linear_attention  model.layers.{i}.linear_attn.{A_log, dt_bias, conv1d.weight,
+                                                        in_proj_qkvz, in_proj_ba,
+                                                        norm, out_proj}.weight
+        full_attention    model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+                          model.layers.{i}.self_attn.{q,k}_norm.weight
+
+    两种层都有 MoE，且都带一个**共享专家**（`mlp.shared_expert.*` 与
+    `mlp.shared_expert_gate.weight`）。共享专家对每个 token 都激活，
+    **不参与驻留集裁剪** —— 承载该层的节点必须装它。
+
+    `layer_types` 用 1-based 的层号索引（`layer_types[l-1]`），与规划器口径一致。
+    """
+    keys: set[str] = set()
+    for layer, experts in plan.layer_experts.items():
+        i = int(layer) - 1                       # 1-based → 0-based
+        p = f"model.layers.{i}"
+        kind = layer_types[i]
+        keys |= {f"{p}.input_layernorm.weight", f"{p}.post_attention_layernorm.weight",
+                 f"{p}.mlp.gate.weight"}
+        if kind == "linear_attention":
+            keys |= {
+                f"{p}.linear_attn.A_log", f"{p}.linear_attn.dt_bias",
+                f"{p}.linear_attn.conv1d.weight",
+                f"{p}.linear_attn.in_proj_qkvz.weight",
+                f"{p}.linear_attn.in_proj_ba.weight",
+                f"{p}.linear_attn.norm.weight",
+                f"{p}.linear_attn.out_proj.weight",
+            }
+        else:
+            keys |= {
+                f"{p}.self_attn.q_proj.weight", f"{p}.self_attn.k_proj.weight",
+                f"{p}.self_attn.v_proj.weight", f"{p}.self_attn.o_proj.weight",
+                f"{p}.self_attn.q_norm.weight", f"{p}.self_attn.k_norm.weight",
+            }
+        if shared_expert:
+            keys |= {
+                f"{p}.mlp.shared_expert.gate_proj.weight",
+                f"{p}.mlp.shared_expert.up_proj.weight",
+                f"{p}.mlp.shared_expert.down_proj.weight",
+                f"{p}.mlp.shared_expert_gate.weight",
+            }
+        for e in experts:
+            keys |= {
+                f"{p}.mlp.experts.{int(e)}.gate_proj.weight",
+                f"{p}.mlp.experts.{int(e)}.up_proj.weight",
+                f"{p}.mlp.experts.{int(e)}.down_proj.weight",
+            }
+    if plan.with_embed:
+        keys.add("model.embed_tokens.weight")
+    if plan.with_lm_head:
+        keys.add("model.norm.weight")
+        keys.add("model.embed_tokens.weight" if tie_word_embeddings else "lm_head.weight")
+    return keys

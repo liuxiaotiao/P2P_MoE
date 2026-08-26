@@ -17,7 +17,40 @@ import json
 from pathlib import Path
 from typing import Mapping
 
-__all__ = ["TINY_QWEN3_MOE", "write_fake_checkpoint", "write_fake_tokenizer"]
+__all__ = ["TINY_QWEN3_MOE", "TINY_QWEN3_NEXT", "write_fake_checkpoint",
+           "write_fake_tokenizer", "write_fake_next_checkpoint"]
+
+TINY_QWEN3_NEXT: dict = {
+    "architectures": ["Qwen3NextForCausalLM"],
+    "model_type": "qwen3_next",
+    "num_hidden_layers": 4,            # 3 层 DeltaNet + 1 层 full attention
+    "full_attention_interval": 4,
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "shared_expert_intermediate_size": 32,
+    "hidden_size": 64,
+    "moe_intermediate_size": 32,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_value_head_dim": 16,
+    "linear_key_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "vocab_size": 512,
+    "rms_norm_eps": 1e-6,
+    "rope_scaling": {"rope_type": "default", "rope_theta": 10000.0,
+                     "partial_rotary_factor": 0.25},
+    "partial_rotary_factor": 0.25,
+    "norm_topk_prob": True,
+    "tie_word_embeddings": False,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
+    "hidden_act": "silu",
+    "torch_dtype": "float32",
+}
 
 # 微型 checkpoint 的对话模板 —— 就是 Qwen3 的 ChatML 骨架，去掉 tools/thinking
 # 那些分支。留着它是为了让 `--chat` 这条路在测试里真的被走到：模板渲染错了
@@ -173,3 +206,96 @@ def write_fake_tokenizer(out_dir: str | Path, *, vocab_size: int = 512) -> Path:
         encoding="utf-8",
     )
     return out / "tokenizer.json"
+
+
+def write_fake_next_checkpoint(out_dir, cfg=None, *, seed: int = 0,
+                               n_shards: int = 2):
+    """微型 Qwen3-Next：**混合层结构 + 共享专家**，key 命名取自真 checkpoint。
+
+    与 `write_fake_checkpoint` 的关键差别是逐层不同 —— 这正是要验的东西：
+    加载器得按层类型出 key，执行层得按层类型算。写一份「每层都一样」的假
+    checkpoint 会把这条最容易错的路径整个绕过去。
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    from ..runtime.qwen3_next import layer_types_of
+
+    cfg = dict(cfg or TINY_QWEN3_NEXT)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    g = torch.Generator().manual_seed(seed)
+    d, V = int(cfg["hidden_size"]), int(cfg["vocab_size"])
+    E, L = int(cfg["num_experts"]), int(cfg["num_hidden_layers"])
+    fmoe, fsh = int(cfg["moe_intermediate_size"]), int(cfg["shared_expert_intermediate_size"])
+    h, kvh, hd = (int(cfg["num_attention_heads"]), int(cfg["num_key_value_heads"]),
+                  int(cfg["head_dim"]))
+    vh, kh = int(cfg["linear_num_value_heads"]), int(cfg["linear_num_key_heads"])
+    vd, kd = int(cfg["linear_value_head_dim"]), int(cfg["linear_key_head_dim"])
+    K = int(cfg["linear_conv_kernel_dim"])
+    key_dim, val_dim = kd * kh, vd * vh
+    kinds = layer_types_of(cfg)
+
+    def rnd(*shape):
+        return (torch.randn(*shape, generator=g) / max(shape[-1], 1) ** 0.5).float()
+
+    t: dict = {
+        "model.embed_tokens.weight": rnd(V, d),
+        "model.norm.weight": torch.ones(d),
+        "lm_head.weight": rnd(V, d),
+    }
+    for i in range(L):
+        p = f"model.layers.{i}"
+        # Qwen3-Next 的 RMSNorm 是**零中心**的（乘 1+weight），所以「恒等」写作 0。
+        # 这里故意给随机值而不是 0：写 0 的话把 `*w` 错写成 `*(1+w)` 也测不出来。
+        t[f"{p}.input_layernorm.weight"] = rnd(d) * 0.1
+        t[f"{p}.post_attention_layernorm.weight"] = rnd(d) * 0.1
+        if kinds[i] == "linear_attention":
+            conv_dim = key_dim * 2 + val_dim
+            t[f"{p}.linear_attn.conv1d.weight"] = rnd(conv_dim, 1, K)
+            t[f"{p}.linear_attn.A_log"] = torch.log(
+                torch.empty(vh).uniform_(1.0, 16.0, generator=g))
+            t[f"{p}.linear_attn.dt_bias"] = torch.ones(vh)
+            t[f"{p}.linear_attn.in_proj_qkvz.weight"] = rnd(key_dim * 2 + val_dim * 2, d)
+            t[f"{p}.linear_attn.in_proj_ba.weight"] = rnd(vh * 2, d)
+            # RMSNormGated 用的是 `w *`（不是 1+w）—— 同一模型两种约定
+            t[f"{p}.linear_attn.norm.weight"] = torch.ones(vd) + rnd(vd) * 0.1
+            t[f"{p}.linear_attn.out_proj.weight"] = rnd(d, val_dim)
+        else:
+            t[f"{p}.self_attn.q_proj.weight"] = rnd(h * hd * 2, d)   # query + 输出门
+            t[f"{p}.self_attn.k_proj.weight"] = rnd(kvh * hd, d)
+            t[f"{p}.self_attn.v_proj.weight"] = rnd(kvh * hd, d)
+            t[f"{p}.self_attn.o_proj.weight"] = rnd(d, h * hd)
+            t[f"{p}.self_attn.q_norm.weight"] = rnd(hd) * 0.1
+            t[f"{p}.self_attn.k_norm.weight"] = rnd(hd) * 0.1
+        t[f"{p}.mlp.gate.weight"] = rnd(E, d)
+        t[f"{p}.mlp.shared_expert.gate_proj.weight"] = rnd(fsh, d)
+        t[f"{p}.mlp.shared_expert.up_proj.weight"] = rnd(fsh, d)
+        t[f"{p}.mlp.shared_expert.down_proj.weight"] = rnd(d, fsh)
+        t[f"{p}.mlp.shared_expert_gate.weight"] = rnd(1, d)
+        for e in range(E):
+            t[f"{p}.mlp.experts.{e}.gate_proj.weight"] = rnd(fmoe, d)
+            t[f"{p}.mlp.experts.{e}.up_proj.weight"] = rnd(fmoe, d)
+            t[f"{p}.mlp.experts.{e}.down_proj.weight"] = rnd(d, fmoe)
+
+    keys = sorted(t)
+    per = max(1, (len(keys) + n_shards - 1) // n_shards)
+    wmap: dict = {}
+    for s_ in range(n_shards):
+        chunk = keys[s_ * per:(s_ + 1) * per]
+        if not chunk:
+            continue
+        name = f"model-{s_+1:05d}-of-{n_shards:05d}.safetensors"
+        save_file({k: t[k].contiguous() for k in chunk}, str(out / name))
+        for k in chunk:
+            wmap[k] = name
+    (out / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": sum(
+            x.numel() * x.element_size() for x in t.values())},
+            "weight_map": wmap}, indent=2), encoding="utf-8")
+    (out / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": _EOS_ID}, indent=2), encoding="utf-8")
+    write_fake_tokenizer(out, vocab_size=V)
+    return out

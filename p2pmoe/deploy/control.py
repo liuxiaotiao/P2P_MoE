@@ -229,35 +229,55 @@ class ModelSetup:
     corpus: object | None = None
     approximate: bool = True
     """后段是否只驻留子集。False = 全装，输出与单机参考实现逐位一致。"""
+    profiles: dict | None = None
+    """逐 task 的 `ActivationProfile`（真模型 + --profile 时才有）。
+    动态模式的分类器要从它构造 —— 见 main() 里 clf 的分支。"""
 
 
 def _load_profile_file(path: Path, tasks: Sequence[str], n_layers: int,
-                       n_experts: int) -> dict[str, ExpertPlacement]:
-    """读离线统计出来的逐 task 逐层驻留集。
+                       n_experts: int, *, coverage: float = 0.95,
+                       top_k: int = 1) -> tuple[dict, dict]:
+    """读激活画像 → (逐 task 驻留集, 逐 task 原始分布)。
 
-    格式：{"task": [[专家 id, ...] × n_layers], ...}，专家 id 是 0-based。
-    这是**真实激活画像**的产物 —— 拿真语料在全量模型上跑一遍、按激活质量降序
-    取到覆盖率阈值。仓库里还没有这一步（TODO.md），所以这个文件目前只能由
-    外部流程产出。
+    两种格式都认（与 `runtime/profile.py` 同一套）：
+
+    * **质量格式**（推荐）`{"tasks": {u: {"layers": {l: [mass…]}}}}` —— 存的是
+      归一化的逐层激活质量。换覆盖率不用重新采样，而且**动态模式的分类器只能
+      从它构造**（分类器要的是分布，不是 id 列表）。
+    * **id 格式** `{u: [[ids] × n_layers]}` —— 外部流程直接给驻留集。
+      能用来部署，但**没有分布就没有分类器**，只能配 `--static`。
+
+    返回的第二项在 id 格式下是 None —— 调用方据此判断能不能走动态模式。
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    out: dict[str, ExpertPlacement] = {}
+    from ..runtime.profile import (
+        load_profile, placement_from_profile, to_activation_profile,
+    )
+
+    raw = load_profile(path)
+    is_ids = raw.get("format") == "ids"
+    have = raw.get("tasks", raw)
+    missing = [u for u in tasks if u not in have]
+    if missing:
+        raise SystemExit(f"--profile 里没有 task {missing}；有的是 {sorted(have)}")
+
+    plcs: dict[str, ExpertPlacement] = {}
+    profs: dict = {}
     for u in tasks:
-        if u not in raw:
-            raise SystemExit(f"--profile 里没有 task {u}；有的是 {sorted(raw)}")
-        rows = raw[u]
-        if len(rows) != n_layers:
-            raise SystemExit(
-                f"--profile 的 task {u} 有 {len(rows)} 层，模型是 {n_layers} 层")
-        sets = []
-        for l, ids in enumerate(rows, 1):
-            es = frozenset(int(e) for e in ids)
-            if not es or max(es) >= n_experts:
-                raise SystemExit(f"task {u} 第 {l} 层的专家 id 越界或为空：{sorted(es)[:5]}")
-            sets.append(es)
-        out[u] = ExpertPlacement(name=u, n_layers=n_layers, sets=tuple(sets),
-                                 achieved_coverage=tuple(1.0 for _ in sets))
-    return out
+        sets = placement_from_profile(raw, u, coverage=coverage,
+                                      n_experts=n_experts, min_experts=top_k,
+                                      layers=list(range(1, n_layers + 1)))
+        full = tuple(range(n_experts))
+        plcs[u] = ExpertPlacement(
+            name=u, n_layers=n_layers,
+            sets=tuple(frozenset(sets.get(l, full)) for l in range(1, n_layers + 1)),
+            achieved_coverage=tuple(coverage if l in sets else 1.0
+                                    for l in range(1, n_layers + 1)),
+            coverage_target=coverage,
+        )
+        if not is_ids:
+            profs[u] = to_activation_profile(raw, u, n_layers=n_layers,
+                                             n_experts=n_experts)
+    return plcs, (profs or None)
 
 
 def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetup:
@@ -300,16 +320,20 @@ def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetu
     ok, why = granularity_verdict(info)
     log.info("      %s %s", "✓" if ok else "✗", why)
 
-    if not args.static:
+    # 动态模式要两样东西，都来自激活画像：前段的并集、在线分类器的参考直方图。
+    # 有 --profile 就都有；没有就只能走 --static（配对定死、请求自报 task）。
+    if not args.static and not args.profile:
         raise SystemExit(
-            "真实模型目前只支持 --static。动态模式要前段并集与在线分类器，"
-            "两者都依赖真实激活画像（TODO.md：离线画像还没接真模型）"
+            "真实模型走动态模式需要 --profile —— 前段并集与在线分类器都从画像来。"
+            "没有画像就用 --static（配对定死、请求自报 task）"
         )
     front = full_placement(info.n_layers, info.n_experts)
 
+    raw_profiles = None
     if args.profile:
-        back_plcs = _load_profile_file(Path(args.profile), names,
-                                       info.n_layers, info.n_experts)
+        back_plcs, raw_profiles = _load_profile_file(
+            Path(args.profile), names, info.n_layers, info.n_experts,
+            coverage=args.coverage, top_k=info.top_k)
         approximate = True
         log.info("      后段驻留集来自 %s，层均 %s", args.profile,
                  {u: round(sum(p.sizes()) / info.n_layers, 1)
@@ -334,10 +358,18 @@ def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetu
             "输出基本是废的。这条路只用来压内存看放置，不要拿它评估质量。",
             args.resident_frac, n)
 
+    if not args.static and raw_profiles is not None:
+        # 前段是 task 无关的，装**并集** ∪_u S_{u,l}（I.1.1）——
+        # 静态模式装全集是因为没有画像；有了画像就该用并集，省下的内存直接
+        # 换成更大的 L₀ 或更多通道
+        front = union_placement(list(back_plcs.values()), name="front-union")
+        log.info("      前段改装并集：层均 %.0f/%d（全集是 %d）",
+                 sum(front.sizes()) / info.n_layers, info.n_experts, info.n_experts)
+
     return ModelSetup(
         label=d.name, spec=spec, n_layers=info.n_layers, n_experts=info.n_experts,
         backend="torch", node_model=hf, front_plc=front, back_plcs=back_plcs,
-        approximate=approximate,
+        approximate=approximate, profiles=raw_profiles,
         tasks=[TaskProfile(name=u, lam=l,
                            experts_per_layer=back_plcs[u].as_experts_per_layer(),
                            placement=back_plcs[u]) for u, l in tasks_lam],
@@ -563,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
     setup = build_model_setup(args, tasks_lam)
     mcfg, spec, front_plc = setup.mcfg, setup.spec, setup.front_plc
     plcs, corpus = setup.back_plcs, setup.corpus
+    profiles_raw = setup.profiles
 
     # ---------------- 1. 采集能力 ---------------------------------------- #
     log.info("[1/5] 采集节点能力（%d 台）", len(addrs))
@@ -743,8 +776,23 @@ def main(argv: list[str] | None = None) -> int:
 
     clf = None
     if not args.static:
-        refs = measure_front_refs(mcfg, corpus, front_plc, l0)
-        clf = HistogramClassifier(refs, dict(tasks_lam), tau_hi=0.55, tau_lo=0.40)
+        if setup.backend == "numpy":
+            # toy 模型：拿同一份合成语料实测参考直方图
+            refs = measure_front_refs(mcfg, corpus, front_plc, l0)
+            clf = HistogramClassifier(refs, dict(tasks_lam), tau_hi=0.55, tau_lo=0.40)
+        elif profiles_raw is not None:
+            # 真模型：参考直方图 = 各 task 在前段层上的激活质量之和。
+            # **这是动态模式在真模型上唯一的分类器来源** —— 没有画像就没有识别，
+            # 而没有识别就只能走 --static（配对定死、请求自报 task）。
+            clf = HistogramClassifier.from_profiles(profiles_raw, l0,
+                                                    dict(tasks_lam),
+                                                    tau_hi=0.55, tau_lo=0.40)
+            log.info("      分类器：从 %s 的前 %d 层激活质量构造",
+                     args.profile, l0)
+        else:
+            log.error("动态模式在真模型上需要 --profile 来构造分类器 —— "
+                      "没有它就没有识别。要么给 --profile，要么用 --static")
+            return 2
     if setup.backend == "numpy":
         # toy 模型能**实测**基线：拿同一份语料、同一条轨迹跑一遍就知道了
         baselines = measure_baseline_miss(mcfg, corpus, front_plc, plcs, l0)

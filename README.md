@@ -52,7 +52,8 @@ python -m pytest -q tests/                       # 343 项测试
 | `sim/network.py` | II.3.1 | 按「出口接入 + 骨干 + 入口接入」建模的可复现分散网络 |
 | `sim/replay.py` | I.1.1 | 回放语料的合成：逐 task 逐层专家激活质量画像 |
 | `sim/scenario.py` | 附录 C | 24 节点池、三 task 画像、p(L₀) 曲线 |
-| `runtime/torch_model.py` | I.1.1、II.5 | **真实 MoE 执行层**：Qwen3-MoE 层（GQA + RoPE + QK-norm）、只驻留子集专家、drop-expert。需 torch |
+| `runtime/torch_model.py` | I.1.1、II.5 | **Qwen3-MoE 执行层**：GQA + RoPE + QK-norm、只驻留子集专家、drop-expert。需 torch |
+| `runtime/qwen3_next.py` | I.1.1、II.5 | **Qwen3-Next 执行层**：混合注意力（Gated DeltaNet + 标准）、共享专家、零中心 norm、部分旋转 RoPE |
 | `runtime/weights.py` | I.1.1 | safetensors 选择性加载：按 (层, 专家 id) 过滤 key，只打开相关分片 |
 | `runtime/model.py` | I.1.1、II.5 | toy MoE：`PartialExpertMoEBlock` 只驻留子集专家、KV cache、miss 统计、drop-expert 重归一 |
 | `runtime/corpus.py` | I.1.1、II.5 | 回放语料、用全专家模型统计激活画像、**实测**告警基线与分类器参考 |
@@ -134,6 +135,28 @@ python3 -m p2pmoe.deploy.run --spec deploy.json \
 python examples/manual_deploy.py --channels 2 --front 1 --back 2
 python examples/manual_deploy.py --spec deploy.json --real --chat --prompt "你好"
 ```
+
+### 支持哪些模型
+
+| | 层结构 | 专家 | 细粒度比 | 状态 |
+|---|---|---|---|---|
+| **Qwen3-MoE**（30B-A3B 等） | 48 层全标准注意力 | 128,top-8 | 16 | ✓ 与官方逐元素一致 |
+| **Qwen3-Next**（80B-A3B） | **36 层 DeltaNet + 12 层标准** | **512,top-10** + 共享专家 | **51** | ✓ 与官方逐元素一致 |
+
+`--model-dir` 指过去就行 —— 节点按 checkpoint 自报的 `model_type` 分派，不用额外开关。
+
+**Qwen3-Next 更适合本方案**：细粒度比 51 意味着单 token 只碰 2% 的专家（Qwen3-30B 是
+6.2%），「后段只驻留子集」的收益大得多。而且 3/4 的层是 Gated DeltaNet，
+它的状态**定长**、不随上下文增长 —— KV 内存远小于同规模的标准 MoE。
+
+它也多了三处能悄悄算错的地方，都由逐元素比对钉住（写的时候三处都踩了）：
+**零中心 RMSNorm**（乘 `1+w` 而非 `w`，权重初始化为 0）、**部分旋转 RoPE**
+（head_dim 256 里只有 64 维带位置信息）、**同一模型两种 norm 约定**
+（`RMSNorm` 用 `1+w`、`RMSNormGated` 用 `w`）。三者都不会报错，只会让输出
+「看起来像模型很笨」。
+
+**共享专家不参与裁剪** —— 它对每个 token 都激活，是那一层的固定成分而非某个
+task 的驻留集，承载该层的节点必须装它（好在只有 6.3MB，与单个路由专家同量级）。
 
 ### 权重也只下需要的那部分
 

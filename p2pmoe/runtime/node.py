@@ -273,30 +273,51 @@ class NodeServer:
         torch / safetensors 是**可选依赖**（requirements-node.txt）——
         只有配成 backend="torch" 的节点才会走到这里，控制机永远不会。
         """
-        from .torch_model import TorchModelConfig, TorchSegmentModel
-        from .weights import KeyPlan, SelectiveLoader, WeightIndex, qwen_moe_keys
+        from .weights import (
+            KeyPlan, SelectiveLoader, WeightIndex, qwen3_next_keys, qwen_moe_keys,
+        )
 
         if not cfg.model_dir:
             raise ValueError("backend='torch' 需要 model_dir")
-        mcfg = TorchModelConfig.from_hf(cfg.model)
+
+        # 按 checkpoint 自报的架构分派。**不要按「有没有某个字段」去猜** ——
+        # 猜错的代价是加载一个结构不对的模型，而它不会报错，只会算出垃圾。
+        arch = str(cfg.model.get("model_type", "")).lower()
+        archs = [str(a).lower() for a in cfg.model.get("architectures", [])]
+        is_next = arch == "qwen3_next" or any("qwen3next" in a for a in archs)
+
         idx = WeightIndex(self.resolve_dir(cfg.model_dir))
         plan = KeyPlan(layer_experts=cfg.layer_experts,
                        with_embed=cfg.with_embed, with_lm_head=cfg.with_lm_head)
-        keys = qwen_moe_keys(plan, tie_word_embeddings=mcfg.tie_word_embeddings)
+        if is_next:
+            from .qwen3_next import NextModelConfig, TorchNextSegmentModel
+
+            mcfg = NextModelConfig.from_hf(cfg.model)
+            keys = qwen3_next_keys(
+                plan, layer_types=list(mcfg.layer_types),
+                shared_expert=mcfg.shared_intermediate > 0,
+                tie_word_embeddings=mcfg.tie_word_embeddings)
+            SegModel = TorchNextSegmentModel
+        else:
+            from .torch_model import TorchModelConfig, TorchSegmentModel
+
+            mcfg = TorchModelConfig.from_hf(cfg.model)
+            keys = qwen_moe_keys(plan, tie_word_embeddings=mcfg.tie_word_embeddings)
+            SegModel = TorchSegmentModel
         tensors, rep = SelectiveLoader(idx).load(
             keys, device=cfg.device, dtype=mcfg.torch_dtype
         )
         if rep.missing:
             raise KeyError(f"checkpoint 缺 {len(rep.missing)} 个 key，首个: {rep.missing[0]}")
-        self.model = TorchSegmentModel(mcfg, cfg.layer_experts, tensors,
-                                       device=cfg.device,
-                                       miss_policy=cfg.miss_policy)
+        self.model = SegModel(mcfg, cfg.layer_experts, tensors, device=cfg.device,
+                              miss_policy=cfg.miss_policy)
         return mcfg, {
             "loaded_gb": round(rep.bytes_loaded / 1e9, 3),
             "ckpt_gb": round(rep.bytes_total / 1e9, 3),
             "load_fraction": round(rep.fraction, 4),
             "shards": f"{rep.shards_opened}/{rep.shards_total}",
             "model_dir": self.resolve_dir(cfg.model_dir),
+            "arch": "qwen3_next" if is_next else "qwen3_moe",
         }
 
     # -- 服务循环 ---------------------------------------------------------- #

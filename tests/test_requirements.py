@@ -118,7 +118,8 @@ def test_test_imports_are_declared() -> None:
 
 # 允许使用 torch/safetensors 的模块 —— 只有真实模型执行层
 HEAVY_ALLOWED = {
-    "p2pmoe/runtime/torch_model.py",
+    "p2pmoe/runtime/torch_model.py",       # Qwen3-MoE 执行层
+    "p2pmoe/runtime/qwen3_next.py",        # Qwen3-Next 执行层（混合注意力）
     "p2pmoe/runtime/weights.py",
     "p2pmoe/sim/fake_checkpoint.py",       # 生成测试用 checkpoint
     "examples/drop_expert_impact.py",      # 离线评估脚本，不在部署路径上

@@ -37,7 +37,9 @@ Qwen3-MoE checkpoint 上验证通过（21 项测试）。关键结论：**驻留
   的半个 UTF-8 字符）、chat template（jinja2 渲染 checkpoint 自带的模板）、
   停止条件（generation_config 优先）。走的是独立的 `tokenizers` 包而不是
   transformers，因此控制机不需要 torch；节点侧只多了一个 `stop_ids` 整数列表；
-* 其它模型家族的 adapter（现在只有 Qwen3-MoE 的 key 命名与 QK-norm）。
+* ~~其它模型家族的 adapter~~ **已加 Qwen3-Next**（`runtime/qwen3_next.py`）：
+  混合注意力、共享专家、零中心 norm、部分旋转 RoPE，与官方逐元素一致
+  （`tests/test_qwen3_next.py`）。再加别的家族仍是同一条路：key 命名 + 层内结构。
 
 原始条目留档：
 
