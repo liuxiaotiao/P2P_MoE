@@ -1,248 +1,371 @@
-# 15 节点部署 Qwen3-30B-A3B：全部指令
+# 15 节点部署 Qwen3-Next-80B-A3B：完整运行流程
 
-照着从上往下执行。每条都标了**在哪台机器上跑**。
-解释性内容在 [DEPLOY.md](DEPLOY.md)，这里只有命令。
+从零到拿到测量结果。每一步都标了**在哪台机器上跑**。
 
-约定：15 台节点叫 `n1`…`n15`，控制机另算（可以是其中一台，也可以是第 16 台）。
+设计与取舍在 [DEPLOY.md](DEPLOY.md)，算法在 `task.docx`。这里只讲怎么跑。
 
 ---
 
-## 0. 先确认连通性
+## 0. 这套东西在跑什么
+
+模型按层切成两段：
+
+- **前段** 层 1–11（L₀=11），**任务无关**，装并集专家。任何请求先进这里。
+- **后段** 层 12–48，**任务相关**，每个 task 一套，只装该 task 的热专家。
+
+请求随机落到任意一条前段 → 前段一边算一边**在线识别**它是 mbpp 还是 gsm8k → 识别定了就派发到对应的后段 → 后段算完出 token。
+
+当前部署（`task/plan_deploy.json`，用真实激活数据 + 真实拓扑离线算出来的）：
+
+| | |
+|---|---|
+| L₀ | 11（拐点，p ≥ 97.69%） |
+| 前段 | 3 条 + 1 条备胎 |
+| 后段 | mbpp 2 条、gsm8k 1 条 |
+| 到达比 | mbpp : gsm8k = 5 : 3 |
+| 覆盖率 | 0.70 —— mbpp 层均 121/512 专家，gsm8k 层均 98/512 |
+| 负载 / 产能 | 0.94×（基本均衡） |
+| 总拉取 | 141 GB（全模型 × 15 台 = 2400 GB，省 94%） |
+
+---
+
+## 1. 角色分工
+
+**控制机**（1 台）——可以是这 15 台里的任意一台，也可以是你的笔记本。
+
+只有它有 `deploy_15.sh`、`plan_deploy.json`、`hosts.txt`。它做：读清单、采集节点能力、探测两两延迟、算配对、把 prompt 编码成 token id 发出去、收 token 解回文本、统计时序。
+
+**它不装 torch** —— 一个张量都不碰，只要 `numpy + tokenizers + jinja2`。这不是省事：控制机装了 torch 就会有人图方便让它"顺手算一层"，那条路一开，控制机就成了隐形的第 16 个计算节点，时序测量立刻失真。`test_requirements.py` 和 `test_heavy_deps_stay_in_the_execution_layer` 守着这条线。
+
+**节点**（15 台）——装 torch，跑矩阵乘。**不需要有 `deploy_15.sh`**。
+
+### 网络要求
 
 | 方向 | 端口 | 必须吗 |
 |---|---|---|
-| **节点 ↔ 节点（两两）** | TCP 9101 | **必须** |
+| **节点 ↔ 节点（两两）** | TCP 9101 | **必须** —— 数据面是节点直接互发，控制机不在中间 |
 | 控制机 ↔ 节点 | TCP 9101 + 协调器随机端口 | **必须** |
 | 节点 → huggingface.co | TCP 443 | 拉权重时 |
-| 控制机 → 节点 SSH | 22 | 不必须（见 §2b） |
+| 控制机 → 节点 SSH | 22 | **不必须**，见 §3b |
 
-节点之间**不需要 SSH**。但两两 TCP 必须通 —— 数据面是节点直接互发，控制机不在中间。
-都在 NAT 后面连不通的话见 §7。
-
----
-
-## 1. 每台节点：装依赖 + 放代码
-
-```bash
-# —— 在 n1…n15 每台上 ——
-pip3 install -r requirements-node.txt      # numpy + torch + safetensors
-mkdir -p /opt/p2pmoe && cd /opt/p2pmoe     # 代码放这里
-# 代码用 rsync 或 git clone 弄过去，不需要 pip install -e .
-```
-
-```bash
-# —— 控制机 ——
-pip3 install -r requirements-control.txt   # numpy + tokenizers + jinja2
-cd /opt/p2pmoe
-cat > hosts.txt <<'EOF'
-n1   10.0.0.11:9101
-n2   10.0.0.12:9101
-n3   10.0.0.13:9101
-n4   10.0.0.14:9101
-n5   10.0.0.15:9101
-n6   10.0.0.16:9101
-n7   10.0.0.17:9101
-n8   10.0.0.18:9101
-n9   10.0.0.19:9101
-n10  10.0.0.20:9101
-n11  10.0.0.21:9101
-n12  10.0.0.22:9101
-n13  10.0.0.23:9101
-n14  10.0.0.24:9101
-n15  10.0.0.25:9101
-EOF
-```
+节点之间**不需要 SSH**。都在 NAT 后面两两连不通的话见 §9。
 
 ---
 
-## 2a. 起 agent（控制机能 SSH 到节点时）
+## 2. 控制机：一次性准备
 
 ```bash
-# —— 控制机 ——
-python3 -m p2pmoe.deploy.launch start  --hosts hosts.txt --workdir /opt/p2pmoe
-python3 -m p2pmoe.deploy.launch status --hosts hosts.txt      # 应显示 15/15 在线
-python3 -m p2pmoe.deploy.launch probe  --hosts hosts.txt --k 8  # 两两可达性
+cd /path/to/p2p-framework
+pip3 install -r requirements-control.txt      # numpy + tokenizers + jinja2
 ```
 
-## 2b. 起 agent（没有 SSH）
+写 `task/hosts.txt`：
+
+```
+# 节点 id  地址:端口
+N01  192.168.1.11:9101
+N02  192.168.1.12:9101
+...
+N15  192.168.1.25:9101
+```
+
+节点 id 必须和 `plan_deploy.json` 里的对上——清单按 id 认人，不按 IP。
+
+设三个环境变量：
 
 ```bash
-# —— 控制机：打印各节点该跑的命令，自己贴过去 ——
-python3 -m p2pmoe.deploy.launch start --hosts hosts.txt --workdir /opt/p2pmoe --dry-run
+export ADVERTISE=192.168.1.100        # 控制机对节点可见的 IP —— 必填
+export SSH_USER=ubuntu                # ssh 用户名，root 就不用设
+export SSH_OPTS="-i ~/.ssh/pool.pem"  # 私钥/端口，没有就不设
 ```
 
-或者做成 systemd（推荐，开机自启 + 崩溃重启）：
+`ADVERTISE` 是必填的：节点建链时要回连控制机，得知道往哪连。写 `127.0.0.1` 会让 15 台各自连自己。
 
-```bash
-# —— 控制机：生成 unit（每台改 --id）——
-python3 -m p2pmoe.deploy.launch systemd --id n1 --workdir /opt/p2pmoe --user p2pmoe
-
-# —— 每台节点 ——
-# 把上面的输出写到 /etc/systemd/system/p2pmoe-agent.service，然后：
-systemctl daemon-reload && systemctl enable --now p2pmoe-agent
-```
-
-agent 是**无状态**的，崩溃重启后回到未配置态等控制器重新下发，所以 `Restart=always` 安全。
+想确认它对不对：在**任意一台节点**上 `curl -v telnet://$ADVERTISE:9300` 应该能连上（先起 `bootstrap`）。
 
 ---
 
-## 3. 第一轮：2 条通道全装，采激活画像
-
-> 为什么不能直接上 4 条：4 前段只剩 11 台分后段，全装每台要 26GB，放不下。
-> 而采画像**必须**全装 —— 只驻留子集时输出被 drop-expert 带偏，采到的不是真实路由。
+## 3a. 有 SSH：一条命令
 
 ```bash
-# —— 控制机 ——
-cat > profile.json <<'EOF'
-{
-  "model_dir": "/data/qwen3-part",
-  "l0": 6,
-  "channels": [
-    {"front": "n1", "back": ["n2",  "n3",  "n4",  "n5",  "n6",  "n7"]},
-    {"front": "n8", "back": ["n9", "n10", "n11", "n12", "n13", "n14", "n15"]}
-  ]
-}
-EOF
-
-# 3.1 布局 → 清单（不连机器、不要权重）
-python3 -m p2pmoe.deploy.run --spec profile.json --plan-only --save-plan p1.json
-
-# 3.2 各节点只拉自己那部分权重（并行，各自直连 HF）
-python3 -m p2pmoe.deploy.launch fetch --hosts hosts.txt --plan p1.json \
-        --repo Qwen/Qwen3-30B-A3B --out /data/qwen3-part
-#   先看会下多少：加 --dry-run
-#   国内镜像：加 --endpoint https://hf-mirror.com
-#   镜像不支持 Range：加 --mode shard（省得少但不依赖 Range）
-
-# 3.3 跑真实请求，采画像
-python3 -m p2pmoe.deploy.run --spec profile.json \
-    --agents "$(python3 -m p2pmoe.deploy.launch agents --hosts hosts.txt)" \
-    --advertise <控制机对节点可见的IP> --device cuda:0 --ctx 2048 \
-    --chat --prompt "<你的真实请求 1>" --prompt "<你的真实请求 2>" \
-    --tokens 128 --profile-out prof.json --once
+./deploy_15.sh all
 ```
 
-画像存在 `prof.json`。**采样量越大越稳** —— 多给几条 `--prompt`，或多跑几次
-（每次换 `--profile-out`，事后合并）。
+等价于依次跑 `sync → check → fetch → start → serve`。
+
+**第一次建议分开跑**，因为 `fetch` 是 141 GB，视带宽可能要几十分钟：
+
+```bash
+./deploy_15.sh sync      # rsync 代码到 15 台 + 各自 pip install
+./deploy_15.sh check     # ssh 可达 → agent 在线 → 两两可达探测
+./deploy_15.sh fetch     # 先 dry-run 给你看会下多少，按 y 才真拉
+./deploy_15.sh start     # 起 15 个 agent
+./deploy_15.sh measure   # 建链 + 打请求 + 逐请求时序
+./deploy_15.sh report    # 出表
+```
+
+### SSH 必须免密
+
+脚本用 `ssh -o BatchMode=yes`，**密码提示会直接把它挂住**。没配的话：
+
+```bash
+ssh-keygen -t ed25519 -N ''
+for i in $(seq 11 25); do ssh-copy-id ubuntu@192.168.1.$i; done
+```
+
+`check` 的第 1 步会**并行**探这 15 台（10 秒出结果），哪台不通会点名。
 
 ---
 
-## 4. 挑覆盖率
+## 3b. 没有 SSH：HTTP 引导
+
+只有引导这一步依赖 ssh —— **agent 起来之后整个控制面都是 TCP**。ssh 在这套代码里从来只是批量便利，不是协议依赖。
+
+**控制机**（终端 A，起着别关）：
 
 ```bash
-# —— 控制机（需要 pip3 install transformers）——
-python examples/drop_expert_impact.py --model-dir /data/qwen3-part \
-    --profile prof.json --coverage 0.90 0.95 0.99 \
-    --policy drop drop_noscale local_topk
+ADVERTISE=192.168.1.100 ./deploy_15.sh bootstrap
 ```
 
-看 **KL** 挑覆盖率（不是看 miss 率）。同时会告诉你三种 `--miss-policy` 哪个好。
+它打包代码、起一个 HTTP 服务（默认 9300）。
+
+**控制机**（终端 B）：
+
+```bash
+./deploy_15.sh cmds          # 15 台各自的命令全打出来
+./deploy_15.sh cmds N07      # 只看某一台
+```
+
+输出形如：
+
+```
+┌─ N07  192.168.1.17:9101
+│  段 F0（front），段内第 2/3
+│  层 2–10（9 层），要拉 11.9 GB，占显存约 12.0 GB
+└─
+
+  mkdir -p /opt/p2pmoe && cd /opt/p2pmoe \
+    && curl -fsSL http://192.168.1.100:9300/p2pmoe.tar.gz | tar xz \
+    && curl -fsSL http://192.168.1.100:9300/plan.json -o /tmp/plan.json \
+    && python3 -m pip install -q -r requirements-node.txt \
+    && python3 -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node N07 \
+         --repo Qwen/Qwen3-Next-80B-A3B-Instruct --out /data/qwen3-next-part \
+    && setsid nohup python3 -m p2pmoe.deploy.agent --id N07 --bind 0.0.0.0:9101 \
+         > /tmp/agent-N07.log 2>&1 &
+```
+
+**每台节点**：把属于它的那一段粘进终端。15 台**互不依赖，可以同时跑**。
+
+一条命令四件事：拉代码 → 装依赖 → **只拉本机那份权重** → 起 agent。
+
+15 台都起来后，控制机 Ctrl-C 关掉 HTTP，然后：
+
+```bash
+./deploy_15.sh check
+./deploy_15.sh measure
+./deploy_15.sh report
+```
+
+**两条路可以混用**：ssh 通的那几台走 `sync`，剩下的手工粘 `cmds` 的命令，结果完全一样。
 
 ---
 
-## 5. 第二轮：4 前段 + 4 后段，正式部署
+## 4. 每台节点具体拿到什么
+
+| 节点 | 段 | 位置 | 层 | 拉取 |
+|---|---|---|---|---|
+| N01 | F0 前段 | 1/3 段首 | 1–1 | 1.7 GB |
+| N07 | F0 前段 | 2/3 | 2–10 | 11.9 GB |
+| N10 | F0 前段 | 3/3 段尾 | 11–11 | 0.9 GB |
+| N11 | F1 前段 | 1/1 独占 | 1–11 | 14.5 GB |
+| N09 | F2 前段 | 1/1 独占 | 1–11 | 14.5 GB |
+| N13 | F-standby0 备胎 | 1/4 段首 | 1–8 | 11.6 GB |
+| N14 | F-standby0 备胎 | 2/4 | 9–9 | 1.1 GB |
+| N15 | F-standby0 备胎 | 3/4 | 10–10 | 0.9 GB |
+| N12 | F-standby0 备胎 | 4/4 段尾 | 11–11 | 0.9 GB |
+| N03 | Bmbpp0 后段 | 1/2 段首 | 12–20 | 7.3 GB |
+| N04 | Bmbpp0 后段 | 2/2 段尾 | 21–48 | 21.8 GB |
+| N05 | Bmbpp1 后段 | 1/2 段首 | 12–20 | 7.3 GB |
+| N02 | Bmbpp1 后段 | 2/2 段尾 | 21–48 | 21.8 GB |
+| N06 | Bgsm8k0 后段 | 1/2 段首 | 12–14 | 1.6 GB |
+| N08 | Bgsm8k0 后段 | 2/2 段尾 | 15–48 | 22.4 GB |
+
+节点本身**不做任何决策**。它不知道自己是前段还是后段——这些全在 `plan.json` 里，离线就算好了。`fetch --node N07` 打开清单找到 N07 那条，只拉这一条列出的张量；`agent --id N07` 起进程监听 9101，报出自己是 N07。剩下的等控制机下发。
+
+所以 15 条命令长得一模一样，唯一的差别是把 `N01`…`N15` 填进去两处。
+
+**备胎链路**（N12–N15）平时不接流量，只在某条前段掉了才顶上。想省 14.5 GB 可以先不部署这 4 台——代价是池子没有余量，掉一条前段就直接降容量。
+
+### 节点自查
 
 ```bash
-# —— 控制机 ——
-cat > deploy.json <<'EOF'
-{
-  "model_dir": "/data/qwen3-part",
-  "l0": 6,
-  "channels": [
-    {"front": "n1",  "back": ["n2",  "n3",  "n4"]},
-    {"front": "n5",  "back": ["n6",  "n7",  "n8"]},
-    {"front": "n9",  "back": ["n10", "n11", "n12"]},
-    {"front": "n13", "back": ["n14", "n15"]}
-  ]
-}
-EOF
-
-# 5.1 新清单
-python3 -m p2pmoe.deploy.run --spec deploy.json --plan-only --save-plan p2.json
-
-# 5.2 重拉权重（驻留集变了，不重拉会报「缺 N 个 key」）
-python3 -m p2pmoe.deploy.launch fetch --hosts hosts.txt --plan p2.json \
-        --repo Qwen/Qwen3-30B-A3B --out /data/qwen3-part
-
-# 5.3 上线
-python3 -m p2pmoe.deploy.run --spec deploy.json \
-    --agents "$(python3 -m p2pmoe.deploy.launch agents --hosts hosts.txt)" \
-    --advertise <控制机IP> --device cuda:0 --ctx 2048 \
-    --profile prof.json --coverage 0.95 --miss-policy drop \
-    --chat --prompt "用一句话解释 MoE 的稀疏激活" --tokens 64 --once
+tail -5 /tmp/agent-N07.log      # 应该只有一行 listening on 0.0.0.0:9101
+ss -lntp | grep 9101
 ```
 
-去掉 `--once` 就常驻。
+统一验在控制机做，不用逐台看：`./deploy_15.sh check`。
 
 ---
 
-## 6. 量时延与算力使用率
+## 5. 测不同的 request
 
-```bash
-python3 -m p2pmoe.deploy.run --spec deploy.json \
-    --agents "$(python3 -m p2pmoe.deploy.launch agents --hosts hosts.txt)" \
-    --advertise <控制机IP> --device cuda:0 --ctx 2048 \
-    --profile prof.json --coverage 0.95 \
-    --chat --prompt "用一句话解释 MoE 的稀疏激活" --tokens 64 \
-    --warmup 2 --timing --requests 1 --once
+### 测试集：`task/cases.txt`
+
+一行一条 prompt。制表符前是**真实 task**：
+
+```
+# 制表符前是真实 task，用来核对在线识别对不对
+mbpp	Write a python function to reverse a linked list.
+gsm8k	Natalia sold clips to 48 friends in April, and half as many in May...
 ```
 
-**`--warmup 2` 不是可选的**：torch 首次前向含 kernel 选择与惰性初始化，
-不预热的话首请求量到的大半是冷启动开销。
+标注**只用来评分，不影响派发**——请求发到哪条后段靠前段自己识别，那才是被测的东西。不写标注也行，按轮转指派真实 task。`#` 开头与空行跳过。
+
+制表符前的字段只有**在 task 列表里认识**时才当成标注，否则整行都是 prompt——代码类 prompt 里制表符是缩进，不该被误读（`test_prompts_file.py` 守着这条）。
+
+`--requests` 比条数多就循环重跑，少就只跑前几条。
+
+### 跑
+
+```bash
+REQUESTS=40 TOKENS=64 RESULTS=results/cov70.json ./deploy_15.sh measure
+./deploy_15.sh report results/cov70.json
+```
+
+`measure` 默认 `WARMUP=2`：先跑 2 条**不计入结果**的请求。torch 首次前向要选 kernel、分配显存池、把权重从 mmap 拉进页缓存——这些只发生一次，混进 p50 会把结果拖歪。
+
+### 看
+
+```
+req    真实   识别      通道              总ms   排队  首tok  /tok   算力
+req0   mbpp  mbpp  ✓  F0×Bmbpp0          33     0    15    3.5   41%
+req1   gsm8k gsm8k ✓  F1×Bgsm8k0         33     0    14    3.1   34%
+──────────────────────────────────────────────────────────────
+  40 条：总时延 p50 25ms，逐 token p50 2.8ms，算力使用率均值 42.1%，识别 98%，换绑 1 次
+
+  时延构成（均值）
+    计算              10ms  41.0%  ████████████████
+    排队               0ms   0.0%
+    网络+协议+调度      15ms  59.0%  ████████████████████████
+
+  各节点算力占比（占总时延，均值）
+    N07   F0      层 2–10   121 专家  30.6%  ██████████████████
+    N04   Bmbpp0  层 21–48  121 专家  13.1%  ████████
+```
+
+### 怎么读这张表
+
+**「网络+协议+调度」是反推的上界，不是测量值。** 15 台没有时钟同步，跨机的绝对时刻拼不到一条轴上，所以它 = 总时延 − 各节点计算 − 排队。三段相加恒等于总时延，这张表不会骗人，但那一栏里混着协议开销和调度延迟，不能当纯网络时间读。
+
+**算力使用率的分母是墙钟，不是「节点数 × 墙钟」。** 这条路上的节点是流水线，同一时刻只有一个在算（段内逐跳、跨段绕环）。所以这个比值的含义是「这条请求的生命周期里，有多少时间真的在做矩阵乘」——40% 不代表浪费了 60% 的卡。
+
+**算力使用率低时先看各节点占比**，是不是某一跳独吞。层数分得不均（比如 N04 拿了 28 层而 N03 只有 9 层）会让流水线卡在长的那一段。
+
+**识别准确率与换绑次数**是动态模式独有的。换绑 = 前段先识别错了、miss 报警后改派到另一个后段。换绑多说明分类器在这批 prompt 上不灵，可以调 `--eta` 或换更长的观测窗。
+
+### 落盘的 JSON
+
+`results/run.json` 里逐请求都有：时序四段拆解、每个 token 的耗时、各节点计算时长与发出字节、识别置信度与判定区、生成的完整文本。测完有一份可复算的底稿，不用回头翻滚屏日志。
 
 ---
 
-## 7. 节点之间连不通时（都在 NAT 后面）
+## 6. 横向对比
 
 ```bash
-# —— 一台有公网入站的机器（控制机通常就是）——
+# 换覆盖率
+for c in 0.70 0.80 0.90; do
+  COVERAGE=$c RESULTS=results/cov$c.json ./deploy_15.sh measure
+done
+
+# 换 miss 策略（serve 后面的参数会透传给 control.py）
+./deploy_15.sh measure --miss-policy drop_noscale
+./deploy_15.sh measure --miss-policy local_topk
+
+# 换并发
+./deploy_15.sh measure --concurrency 1     # 每条 path 只跑一个 request
+```
+
+三种 miss 策略——后段没装全被路由到的专家时怎么办：
+
+| | 做法 |
+|---|---|
+| `drop` | 丢掉缺的，门控权重重归一 |
+| `drop_noscale` | 丢掉缺的，**不**重归一（实测更好） |
+| `local_topk` | 在驻留集里重新取 top-k |
+
+**改 `COVERAGE` 是真的改了后段驻留集**，每轮会重新装载专家，那几分钟躲不掉。只改 `cases.txt` 和 `REQUESTS` 的话重跑就快得多。
+
+---
+
+## 7. 改了代码之后
+
+`start` 只是 `cd $WORKDIR && python -m ...`，**它不会推代码**：
+
+```bash
+./deploy_15.sh stop && ./deploy_15.sh sync && ./deploy_15.sh start
+```
+
+漏了 `sync` 的话跑的还是旧代码，**而且不会报错**——这是最容易踩的坑。
+
+没 ssh 的话重跑 `bootstrap` + 各节点重粘一次命令（权重已经在本地，`fetch` 会跳过已有的）。
+
+---
+
+## 8. 常见问题
+
+**`✗ 必须设 ADVERTISE`** —— 见 §2。
+
+**`规划失败: 公共中值域人口 0`** —— 节点之间延迟差异太小（比如全在一台机器上模拟），公共中值域退化。真机上不会遇到；本地演练加 `--mem-cap-mb`。
+
+**`没有 L₀ 同时满足 p ≥ 0.8…`** —— 内存上限太紧，前段单节点装不下。真机上 24 GB 卡装 L₀=11 的前段（14.5 GB）是够的。
+
+**某台 agent 没起来** —— `tail /tmp/agent-N07.log`。最常见是 `--out` 目录没权限，或 torch 装的是 CPU 版而 `--device cuda:0`。
+
+**`节点上报的错误`** —— 通常是权重缺张量。让那台重跑一次 `fetch`（它会跳过已有的，只补缺的）。
+
+**请求超时** —— `report` 里看 `missing_traces`：哪台没上报埋点。没上报的节点，它的计算时间会被算进「网络」那一栏。
+
+---
+
+## 9. 都在 NAT 后面
+
+节点之间两两连不通时，起一台中继：
+
+```bash
+# 一台双方都能连到的机器上
 python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
-
-# —— 每台节点：不监听端口，改成挂到中继上 ——
-python3 -m p2pmoe.deploy.agent --id n3 --relay <中继IP>:9200
-
-# —— 控制机：所有 run/control 命令加同一个 --relay ——
-python3 -m p2pmoe.deploy.run --spec deploy.json --relay <中继IP>:9200 ...
 ```
 
-代价：每跳绕一圈，逐 token 延迟大致翻倍；中继是带宽瓶颈与单点。
-**能上 WireGuard / Tailscale 就上**，那样恢复真直连，框架什么都不用改。
+各节点的 agent 和控制机的 control 都加 `--relay <中继IP>:9200`。
+
+中继握手完就**只搬字节，不认识 p2pmoe 的协议**——上层完全分辨不出中间隔了一台机器（`test_relay.py` 测的就是这件事）。代价是每跳绕一圈，逐 token 延迟大致翻倍。
 
 ---
 
-## 8. 停
+## 附：命令速查
 
-```bash
-python3 -m p2pmoe.deploy.launch stop --hosts hosts.txt        # 有 SSH
-python3 -m p2pmoe.deploy.launch stop --hosts hosts.txt --dry-run   # 没 SSH，打印命令
-```
-
----
-
-## 内存账（Qwen3-30B-A3B，ctx=2048，bf16）
-
-全模型 61.0GB；每层 attention 38MB + 128 × 专家 9.4MB。
-
-| 布局 | 前段/台 | 后段最大/台 | 合计下载 |
-|---|---|---|---|
-| 2 通道（后段 6/7 台）全装 | 7.5GB | **8.7GB** ✓ | 239GB |
-| 3 通道（后段各 4 台）全装 | 7.5GB | **13.7GB** ✓ | 239GB |
-| 4 通道（后段各 3/2 台）全装 | 7.5GB | **26.2GB** ✗ | 239GB |
-| 4 通道，后段 20% 专家 | 7.5GB | **6.0GB** ✓ | 78GB |
-
-前段装全部 128 个专家（task 无关，L₀=6）；后段按画像裁。
-**4 通道必须裁后段** —— 这就是为什么要先用 2 通道采画像。
-
----
-
-## 常见故障
-
-| 症状 | 原因 | 处置 |
+| 命令 | 在哪跑 | 做什么 |
 |---|---|---|
-| 预检「读不到 checkpoint」 | `--model-dir` 是**各节点本地路径**，控制机能读不代表节点能 | 跑 §3.2 的 fetch，或挂共享存储 |
-| 加载报「缺 N 个 key」 | 驻留集变了但没重拉权重 | 用新 plan 重跑 fetch |
-| fetch 报「不支持 Range 请求」 | 镜像把整文件发回来了 | 换 `--mode shard`，或换支持 Range 的源 |
-| 「没装 torch」 | 节点装成了 `requirements.txt` | 装 `requirements-node.txt` |
-| 「没装 tokenizers」 | 控制机少装 | 装 `requirements-control.txt` |
-| probe 大面积不可达 | 节点之间没放行 | 放行 9101 两两；实在不通走 §7 中继 |
-| 首 token 特别慢 | torch 冷启动 | 加 `--warmup 2` |
+| `./deploy_15.sh sync` | 控制机 | rsync 代码 + 装依赖到 15 台（要 ssh） |
+| `./deploy_15.sh bootstrap` | 控制机 | 起 HTTP 服务发代码（不要 ssh） |
+| `./deploy_15.sh cmds [节点]` | 控制机 | 打印每台该跑的命令 |
+| `./deploy_15.sh check` | 控制机 | ssh 可达 + agent 在线 + 两两可达 |
+| `./deploy_15.sh fetch` | 控制机 | 各节点只拉自己那份权重 |
+| `./deploy_15.sh start` | 控制机 | 起 15 个 agent |
+| `./deploy_15.sh serve` | 控制机 | 建链 + 打请求 |
+| `./deploy_15.sh measure` | 控制机 | 同上 + 预热 + 逐请求时序 |
+| `./deploy_15.sh report [文件]` | 控制机 | 把结果 JSON 读成表 |
+| `./deploy_15.sh stop` | 控制机 | 停 15 个 agent |
+
+配置项（环境变量覆盖，或改脚本顶部）：
+
+```
+HOSTS=task/hosts.txt          PLAN=task/plan_deploy.json
+PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
+WEIGHTS=/data/qwen3-next-part   WORKDIR=/opt/p2pmoe
+ADVERTISE=<必填>               DEVICE=cuda:0
+COVERAGE=0.70                  TASKS=mbpp=5,gsm8k=3
+TOKENS=64  REQUESTS=20  WARMUP=2
+PROMPTS=task/cases.txt         RESULTS=results/run.json
+SSH_USER=  SSH_OPTS=  BOOT_PORT=9300  HF_ENDPOINT=
+```

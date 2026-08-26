@@ -591,6 +591,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="跳过「每台节点能不能读到 checkpoint」的预检")
     ap.add_argument("--prompt", action="append", default=None,
                     help="文本 prompt，可重复。需要 --model-dir")
+    ap.add_argument("--warmup", type=int, default=0, metavar="N",
+                    help="先跑 N 条**不计入结果**的请求。torch 首次前向要选 kernel、"
+                         "分配显存池、把权重从 mmap 拉进页缓存 —— 这些都只发生一次。"
+                         "不预热的话第一条请求会明显偏慢，把 p50 也拖歪。"
+                         "量时延就该给 --warmup 2 起步")
     ap.add_argument("--prompts-file", type=Path, default=None,
                     help="一行一条 prompt 的文件。想标注真实 task 就写成 "
                          "`mbpp\t写一个反转链表的函数` —— 制表符前是 task 名，"
@@ -938,6 +943,29 @@ def main(argv: list[str] | None = None) -> int:
                          rec.front, rec.back, rec.rebinds,
                          rec.wait_front_ms, rec.wait_back_ms,
                          (rec.t_first - rec.t0) * 1000, p50)
+
+    if args.warmup:
+        log.info("  预热 %d 条（不计入结果）—— torch 首次前向含 kernel 选择、"
+                 "显存池分配、权重进页缓存，只发生一次", args.warmup)
+        wrows_at = len(rows)
+        for i in range(args.warmup):
+            u = names[i % len(names)]
+            if textio and cases:
+                tu, txt = cases[i % len(cases)]
+                r = coord.submit(f"warm{i}", text=txt, true_task=tu or u,
+                                 task=(tu or u) if args.static else None)
+            elif textio and args.prompt:
+                r = coord.submit(f"warm{i}", text=args.prompt[i % len(args.prompt)],
+                                 true_task=u, task=u if args.static else None)
+            else:
+                r = coord.submit(f"warm{i}", sample_prompt(corpus, u, 12, seed=9000 + i),
+                                 true_task=u, task=u if args.static else None)
+            r.done.wait(timeout=300)
+        # 丢掉预热产生的记录 —— 它们混进 p50 就白预热了
+        del rows[wrows_at:]
+        coord.pairings[:] = [x for x in coord.pairings
+                             if not x[0].startswith("warm")]
+        log.info("  预热完成，开始正式测量")
 
     for i in range(args.requests):
         u = names[i % len(names)]

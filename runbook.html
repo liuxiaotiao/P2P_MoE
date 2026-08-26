@@ -1,0 +1,785 @@
+<title>Qwen3-Next 部署手册</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#F4F6F8;
+  --surface:#FFFFFF;
+  --sunken:#EAEEF2;
+  --ink:#161C22;
+  --ink-2:#3E4A55;
+  --ink-3:#6B7883;
+  --rule:#D7DEE5;
+  --rule-soft:#E6EBF0;
+  --accent:#0B6E7F;
+  --accent-soft:#E0F0F3;
+  --front:#0B6E7F;
+  --front-soft:#DDEEF1;
+  --back:#9A5B14;
+  --back-soft:#F7EAD8;
+  --spare:#8892A0;
+  --spare-soft:#E8ECF0;
+  --crit:#A3282B;
+  --crit-soft:#F8E5E5;
+  --term-bg:#12181E;
+  --term-ink:#D3DBE3;
+  --term-dim:#6E7C89;
+  --term-key:#5FBFD0;
+  --term-str:#C9A66B;
+  --shadow:0 1px 2px rgba(22,28,34,.06), 0 8px 24px -12px rgba(22,28,34,.18);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F1418;
+    --surface:#171E24;
+    --sunken:#1E272E;
+    --ink:#E6ECF1;
+    --ink-2:#AFBCC7;
+    --ink-3:#7C8994;
+    --rule:#2C3841;
+    --rule-soft:#232D35;
+    --accent:#4FC3D6;
+    --accent-soft:#12323A;
+    --front:#4FC3D6;
+    --front-soft:#12323A;
+    --back:#D9A25A;
+    --back-soft:#332512;
+    --spare:#7C8994;
+    --spare-soft:#232D35;
+    --crit:#E48285;
+    --crit-soft:#3A1E1F;
+    --term-bg:#0A0E12;
+    --term-ink:#D3DBE3;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F1418;
+  --surface:#171E24;
+  --sunken:#1E272E;
+  --ink:#E6ECF1;
+  --ink-2:#AFBCC7;
+  --ink-3:#7C8994;
+  --rule:#2C3841;
+  --rule-soft:#232D35;
+  --accent:#4FC3D6;
+  --accent-soft:#12323A;
+  --front:#4FC3D6;
+  --front-soft:#12323A;
+  --back:#D9A25A;
+  --back-soft:#332512;
+  --spare:#7C8994;
+  --spare-soft:#232D35;
+  --crit:#E48285;
+  --crit-soft:#3A1E1F;
+  --term-bg:#0A0E12;
+  --term-ink:#D3DBE3;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font:400 16px/1.65 "IBM Plex Sans","Noto Sans SC",system-ui,-apple-system,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3{font-family:Archivo,"IBM Plex Sans","Noto Sans SC",system-ui,sans-serif;text-wrap:balance;margin:0}
+code,kbd,pre,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+
+/* ---------- shell ---------- */
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px 96px}
+.grid{display:grid;grid-template-columns:190px minmax(0,1fr);gap:56px;align-items:start}
+@media(max-width:900px){.grid{grid-template-columns:1fr;gap:0}}
+
+/* ---------- masthead ---------- */
+.mast{border-bottom:1px solid var(--rule);margin-bottom:40px;padding:48px 0 32px}
+.eyebrow{
+  font:600 11px/1 "IBM Plex Mono",monospace;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:16px;
+}
+.mast h1{font-size:clamp(30px,4.4vw,46px);font-weight:700;letter-spacing:-.02em;line-height:1.1}
+.mast .sub{color:var(--ink-2);font-size:17px;margin-top:14px;max-width:60ch}
+.facts{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));
+  gap:1px;background:var(--rule-soft);border:1px solid var(--rule-soft);
+  border-radius:8px;overflow:hidden;margin-top:32px;
+}
+.fact{background:var(--surface);padding:14px 16px}
+.fact dt{font:600 10px/1 "IBM Plex Mono",monospace;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3)}
+.fact dd{margin:8px 0 0;font:600 21px/1.1 Archivo,sans-serif;font-variant-numeric:tabular-nums}
+.fact dd small{font-size:12px;font-weight:500;color:var(--ink-3);display:block;margin-top:5px;font-family:"IBM Plex Sans",sans-serif;letter-spacing:0}
+
+/* ---------- nav rail ---------- */
+nav{position:sticky;top:24px}
+@media(max-width:900px){
+  nav{position:static;margin-bottom:40px;padding-bottom:24px;border-bottom:1px solid var(--rule)}
+  nav ol{display:flex;flex-wrap:wrap;gap:6px}
+}
+nav ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px}
+nav a{
+  display:flex;gap:10px;align-items:baseline;padding:6px 9px;border-radius:5px;
+  text-decoration:none;color:var(--ink-2);font-size:13.5px;line-height:1.35;
+  transition:background .12s,color .12s;
+}
+nav a:hover{background:var(--sunken);color:var(--ink)}
+nav a .n{
+  font:600 10px/1 "IBM Plex Mono",monospace;color:var(--ink-3);
+  font-variant-numeric:tabular-nums;flex:none;padding-top:3px;
+}
+nav a.on{background:var(--accent-soft);color:var(--accent)}
+nav a.on .n{color:var(--accent)}
+
+/* ---------- sections ---------- */
+section{scroll-margin-top:24px;margin-bottom:60px}
+section > h2{
+  font-size:23px;font-weight:600;letter-spacing:-.012em;
+  padding-bottom:11px;border-bottom:2px solid var(--ink);margin-bottom:22px;
+  display:flex;align-items:baseline;gap:12px;
+}
+section > h2 .n{
+  font:600 11px/1 "IBM Plex Mono",monospace;color:var(--accent);
+  letter-spacing:.1em;flex:none;
+}
+h3{font-size:15.5px;font-weight:600;margin:30px 0 11px;letter-spacing:-.005em}
+p{margin:0 0 14px;max-width:68ch}
+p:last-child{margin-bottom:0}
+ul,ol.list{margin:0 0 14px;padding-left:20px;max-width:66ch}
+li{margin-bottom:6px}
+strong{font-weight:600}
+.lede{font-size:17px;color:var(--ink-2);max-width:64ch}
+
+/* ---------- terminal blocks ---------- */
+.term{
+  background:var(--term-bg);border-radius:8px;margin:0 0 18px;
+  overflow:hidden;position:relative;box-shadow:var(--shadow);
+}
+.term-head{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:8px 12px 8px 14px;border-bottom:1px solid rgba(255,255,255,.07);
+}
+.term-where{
+  font:600 10px/1 "IBM Plex Mono",monospace;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--term-key);
+}
+.term-where.node{color:var(--term-str)}
+.copy{
+  font:500 11px/1 "IBM Plex Mono",monospace;color:var(--term-dim);
+  background:transparent;border:1px solid rgba(255,255,255,.14);border-radius:4px;
+  padding:5px 9px;cursor:pointer;transition:.14s;flex:none;
+}
+.copy:hover{color:var(--term-ink);border-color:rgba(255,255,255,.32)}
+.copy.done{color:var(--term-key);border-color:var(--term-key)}
+.term pre{
+  margin:0;padding:14px;overflow-x:auto;
+  font-size:13px;line-height:1.72;color:var(--term-ink);
+}
+.term .c{color:var(--term-dim)}
+.term .k{color:var(--term-key)}
+.term .s{color:var(--term-str)}
+
+code:not(pre code){
+  background:var(--sunken);padding:.1em .38em;border-radius:3px;
+  font-size:.875em;border:1px solid var(--rule-soft);
+}
+
+/* ---------- tables ---------- */
+.scroll{overflow-x:auto;margin:0 0 18px;border:1px solid var(--rule);border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--rule-soft)}
+thead th{
+  font:600 10px/1.3 "IBM Plex Mono",monospace;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);background:var(--sunken);white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:0}
+td.num{text-align:right;font-variant-numeric:tabular-nums;font-family:"IBM Plex Mono",monospace}
+td.id{font:600 13px/1 "IBM Plex Mono",monospace}
+
+.chip{
+  display:inline-block;padding:2.5px 8px;border-radius:20px;
+  font:600 10.5px/1.35 "IBM Plex Mono",monospace;letter-spacing:.04em;white-space:nowrap;
+}
+.chip.f{background:var(--front-soft);color:var(--front)}
+.chip.b{background:var(--back-soft);color:var(--back)}
+.chip.s{background:var(--spare-soft);color:var(--spare)}
+
+/* ---------- layer map ---------- */
+.map{
+  background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:20px 22px 16px;margin:0 0 18px;
+}
+.map-legend{
+  display:flex;flex-wrap:wrap;gap:16px;align-items:center;
+  font-size:11.5px;color:var(--ink-3);margin-bottom:20px;
+}
+.map-legend span{display:flex;align-items:center;gap:6px}
+.sw{width:11px;height:11px;border-radius:2.5px;flex:none}
+.map-row{display:grid;grid-template-columns:96px minmax(0,1fr);gap:14px;align-items:center;margin-bottom:7px}
+.map-lab{font:600 11px/1.3 "IBM Plex Mono",monospace;color:var(--ink-2);text-align:right}
+.map-track{
+  position:relative;height:26px;background:var(--sunken);border-radius:4px;
+  overflow:hidden;border:1px solid var(--rule-soft);
+}
+.seg{
+  position:absolute;top:0;height:100%;display:flex;align-items:center;justify-content:center;
+  font:600 10px/1 "IBM Plex Mono",monospace;color:#fff;overflow:hidden;white-space:nowrap;
+  border-right:1px solid rgba(0,0,0,.28);
+}
+.seg:last-child{border-right:0}
+.seg.f{background:var(--front)}
+.seg.b{background:var(--back)}
+.seg.s{background:var(--spare)}
+.map-axis{
+  display:grid;grid-template-columns:96px minmax(0,1fr);gap:14px;
+  margin-top:12px;padding-top:10px;border-top:1px solid var(--rule-soft);
+}
+.axis-track{position:relative;height:15px;font:500 10px/1 "IBM Plex Mono",monospace;color:var(--ink-3)}
+.axis-track i{position:absolute;font-style:normal;transform:translateX(-50%)}
+.cut{
+  position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--crit);
+  z-index:3;border-radius:1px;
+}
+
+/* ---------- callouts ---------- */
+.note{
+  border-left:3px solid var(--accent);background:var(--accent-soft);
+  padding:13px 16px;border-radius:0 6px 6px 0;margin:0 0 18px;font-size:14.5px;
+}
+.note.warn{border-left-color:var(--crit);background:var(--crit-soft)}
+.note p{max-width:64ch}
+.note p:last-child{margin-bottom:0}
+.note b{font-weight:600}
+
+/* ---------- path toggle ---------- */
+.paths{display:flex;gap:8px;margin:0 0 22px;padding:5px;background:var(--sunken);border-radius:8px;flex-wrap:wrap}
+.paths button{
+  flex:1 1 200px;text-align:left;padding:11px 14px;border-radius:6px;cursor:pointer;
+  background:transparent;border:1px solid transparent;color:var(--ink-2);
+  font:500 14px/1.35 "IBM Plex Sans","Noto Sans SC",sans-serif;transition:.14s;
+}
+.paths button b{display:block;font-weight:600;color:var(--ink);margin-bottom:3px;font-size:14.5px}
+.paths button small{font-size:11.5px;color:var(--ink-3)}
+.paths button[aria-selected="true"]{background:var(--surface);border-color:var(--rule);box-shadow:var(--shadow)}
+.paths button[aria-selected="true"] b{color:var(--accent)}
+[hidden]{display:none !important}
+
+/* ---------- misc ---------- */
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px;margin-bottom:18px}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:16px 18px}
+.card h4{margin:0 0 8px;font:600 13px/1.3 Archivo,sans-serif}
+.card p{font-size:13.5px;color:var(--ink-2);margin:0}
+.kv{font-size:13.5px;line-height:1.9;font-family:"IBM Plex Mono",monospace;color:var(--ink-2)}
+footer{margin-top:56px;padding-top:22px;border-top:1px solid var(--rule);color:var(--ink-3);font-size:13px}
+@media(prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important}}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow">P2P MoE · 双段模型放置</div>
+  <h1>Qwen3-Next 15 节点部署手册</h1>
+  <p class="sub">从零到拿到测量结果。每一步都标了在哪台机器上跑 —— 控制机还是节点。</p>
+  <dl class="facts">
+    <div class="fact"><dt>切点 L₀</dt><dd>11<small>p ≥ 97.69%</small></dd></div>
+    <div class="fact"><dt>前段</dt><dd>3+1<small>3 条 + 1 条备胎</small></dd></div>
+    <div class="fact"><dt>后段</dt><dd>2+1<small>mbpp 2、gsm8k 1</small></dd></div>
+    <div class="fact"><dt>覆盖率</dt><dd>0.70<small>层均 121 / 512 专家</small></dd></div>
+    <div class="fact"><dt>负载比</dt><dd>0.94×<small>负载 / 产能</small></dd></div>
+    <div class="fact"><dt>总拉取</dt><dd>141<small>GB，省 94%</small></dd></div>
+  </dl>
+</header>
+
+<div class="grid">
+
+<nav aria-label="流程步骤">
+  <ol>
+    <li><a href="#s0"><span class="n">00</span><span>在跑什么</span></a></li>
+    <li><a href="#s1"><span class="n">01</span><span>角色分工</span></a></li>
+    <li><a href="#s2"><span class="n">02</span><span>控制机准备</span></a></li>
+    <li><a href="#s3"><span class="n">03</span><span>引导 15 台</span></a></li>
+    <li><a href="#s4"><span class="n">04</span><span>各节点拿什么</span></a></li>
+    <li><a href="#s5"><span class="n">05</span><span>测 request</span></a></li>
+    <li><a href="#s6"><span class="n">06</span><span>横向对比</span></a></li>
+    <li><a href="#s7"><span class="n">07</span><span>改代码之后</span></a></li>
+    <li><a href="#s8"><span class="n">08</span><span>排错</span></a></li>
+    <li><a href="#s9"><span class="n">09</span><span>都在 NAT 后面</span></a></li>
+    <li><a href="#sa"><span class="n">──</span><span>命令速查</span></a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ============ 0 ============ -->
+<section id="s0">
+  <h2><span class="n">00</span>这套东西在跑什么</h2>
+  <p class="lede">模型按层切成两段，请求先过任务无关的前段，识别出任务后再派发到对应的后段。</p>
+
+  <div class="two">
+    <div class="card">
+      <h4>前段 · 层 1–11</h4>
+      <p><b>任务无关</b>，装并集专家。任何请求先进这里。它一边算一边在线识别这条请求是 mbpp 还是 gsm8k。</p>
+    </div>
+    <div class="card">
+      <h4>后段 · 层 12–48</h4>
+      <p><b>任务相关</b>，每个 task 一套，只装该 task 的热专家（覆盖 70% 激活度）。识别定了才派发过来。</p>
+    </div>
+  </div>
+
+  <p>当前部署来自 <code>task/plan_deploy.json</code> —— 用真实激活数据加真实拓扑离线算出来的。到达比 mbpp : gsm8k = 5 : 3。</p>
+</section>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="n">01</span>角色分工</h2>
+
+  <h3>控制机（1 台）</h3>
+  <p>可以是这 15 台里的任意一台，也可以是你的笔记本。只有它有 <code>deploy_15.sh</code>、<code>plan_deploy.json</code>、<code>hosts.txt</code>。</p>
+  <p>它做：读清单、采集节点能力、探测两两延迟、算配对、把 prompt 编码成 token id 发出去、收 token 解回文本、统计时序。</p>
+
+  <div class="note">
+    <p><b>它不装 torch。</b>一个张量都不碰，只要 <code>numpy + tokenizers + jinja2</code>。这不是省事：控制机装了 torch 就会有人图方便让它「顺手算一层」，那条路一开，控制机就成了隐形的第 16 个计算节点，时序测量立刻失真。仓库里两条测试守着这条线。</p>
+  </div>
+
+  <h3>节点（15 台）</h3>
+  <p>装 torch，跑矩阵乘。<b>不需要有 <code>deploy_15.sh</code></b> —— 它是控制机的驾驶舱，不是要分发的东西。</p>
+
+  <h3>网络要求</h3>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>方向</th><th>端口</th><th>必须吗</th></tr></thead>
+      <tbody>
+        <tr><td><b>节点 ↔ 节点（两两）</b></td><td class="mono">TCP 9101</td><td><b>必须</b> —— 数据面是节点直接互发，控制机不在中间</td></tr>
+        <tr><td>控制机 ↔ 节点</td><td class="mono">TCP 9101 + 协调器随机端口</td><td><b>必须</b></td></tr>
+        <tr><td>节点 → huggingface.co</td><td class="mono">TCP 443</td><td>拉权重时</td></tr>
+        <tr><td>控制机 → 节点 SSH</td><td class="mono">22</td><td>不必须，见 <a href="#s3">§03</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>节点之间<b>不需要 SSH</b>。都在 NAT 后面两两连不通的话见 <a href="#s9">§09</a>。</p>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="n">02</span>控制机：一次性准备</h2>
+
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre><span class="k">cd</span> /path/to/p2p-framework
+pip3 install -r requirements-control.txt      <span class="c"># numpy + tokenizers + jinja2</span></pre>
+  </div>
+
+  <h3>写 <code>task/hosts.txt</code></h3>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre><span class="c"># 节点 id  地址:端口</span>
+N01  192.168.1.11:9101
+N02  192.168.1.12:9101
+<span class="c">...</span>
+N15  192.168.1.25:9101</pre>
+  </div>
+  <p>节点 id 必须和清单里的对上 —— <b>清单按 id 认人，不按 IP</b>。</p>
+
+  <h3>三个环境变量</h3>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre><span class="k">export</span> ADVERTISE=<span class="s">192.168.1.100</span>        <span class="c"># 控制机对节点可见的 IP —— 必填</span>
+<span class="k">export</span> SSH_USER=<span class="s">ubuntu</span>                <span class="c"># ssh 用户名，root 就不用设</span>
+<span class="k">export</span> SSH_OPTS=<span class="s">"-i ~/.ssh/pool.pem"</span>  <span class="c"># 私钥/端口，没有就不设</span></pre>
+  </div>
+
+  <div class="note warn">
+    <p><code>ADVERTISE</code> 是必填的：节点建链时要<b>回连</b>控制机，得知道往哪连。写 <code>127.0.0.1</code> 会让 15 台各自连自己。</p>
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="n">03</span>引导 15 台</h2>
+  <p class="lede">只有引导这一步依赖 ssh。agent 起来之后整个控制面都是 TCP —— ssh 从来只是批量便利，不是协议依赖。</p>
+
+  <div class="paths" role="tablist" aria-label="引导方式">
+    <button role="tab" id="tab-ssh" aria-controls="p-ssh" aria-selected="true">
+      <b>有 SSH</b><small>控制机一条命令推到 15 台</small>
+    </button>
+    <button role="tab" id="tab-http" aria-controls="p-http" aria-selected="false">
+      <b>没有 SSH</b><small>HTTP 发代码，每台粘一条命令</small>
+    </button>
+  </div>
+
+  <div id="p-ssh" role="tabpanel" aria-labelledby="tab-ssh">
+    <div class="term">
+      <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>./deploy_15.sh sync      <span class="c"># rsync 代码到 15 台 + 各自 pip install</span>
+./deploy_15.sh check     <span class="c"># ssh 可达 → agent 在线 → 两两可达探测</span>
+./deploy_15.sh fetch     <span class="c"># 先 dry-run 给你看会下多少，按 y 才真拉</span>
+./deploy_15.sh start     <span class="c"># 起 15 个 agent</span>
+./deploy_15.sh measure   <span class="c"># 建链 + 打请求 + 逐请求时序</span>
+./deploy_15.sh report    <span class="c"># 出表</span></pre>
+    </div>
+    <p>一条龙是 <code>./deploy_15.sh all</code>。<b>第一次建议分开跑</b> —— <code>fetch</code> 是 141 GB，视带宽可能要几十分钟。</p>
+
+    <h3>SSH 必须免密</h3>
+    <p>脚本用 <code>ssh -o BatchMode=yes</code>，<b>密码提示会直接把它挂住</b>。</p>
+    <div class="term">
+      <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>ssh-keygen -t ed25519 -N <span class="s">''</span>
+<span class="k">for</span> i <span class="k">in</span> $(seq 11 25); <span class="k">do</span> ssh-copy-id ubuntu@192.168.1.$i; <span class="k">done</span></pre>
+    </div>
+    <p><code>check</code> 的第一步会<b>并行</b>探这 15 台（10 秒出结果），哪台不通会点名。</p>
+  </div>
+
+  <div id="p-http" role="tabpanel" aria-labelledby="tab-http" hidden>
+    <h3>控制机 · 终端 A（起着别关）</h3>
+    <div class="term">
+      <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>ADVERTISE=192.168.1.100 ./deploy_15.sh bootstrap</pre>
+    </div>
+    <p>它打包代码、起一个 HTTP 服务（默认 9300）。</p>
+
+    <h3>控制机 · 终端 B</h3>
+    <div class="term">
+      <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>./deploy_15.sh cmds          <span class="c"># 15 台各自的命令全打出来</span>
+./deploy_15.sh cmds N07      <span class="c"># 只看某一台</span></pre>
+    </div>
+
+    <h3>每台节点 · 粘属于它的那一段</h3>
+    <div class="term">
+      <div class="term-head"><span class="term-where node">节点 N07</span><button class="copy">复制</button></div>
+<pre>mkdir -p /opt/p2pmoe &amp;&amp; <span class="k">cd</span> /opt/p2pmoe \
+  &amp;&amp; curl -fsSL http://192.168.1.100:9300/p2pmoe.tar.gz | tar xz \
+  &amp;&amp; curl -fsSL http://192.168.1.100:9300/plan.json -o /tmp/plan.json \
+  &amp;&amp; python3 -m pip install -q -r requirements-node.txt \
+  &amp;&amp; python3 -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node <span class="s">N07</span> \
+       --repo Qwen/Qwen3-Next-80B-A3B-Instruct --out /data/qwen3-next-part \
+  &amp;&amp; setsid nohup python3 -m p2pmoe.deploy.agent --id <span class="s">N07</span> --bind 0.0.0.0:9101 \
+       &gt; /tmp/agent-N07.log 2&gt;&amp;1 &amp;</pre>
+    </div>
+    <p>一条命令四件事：拉代码 → 装依赖 → <b>只拉本机那份权重</b> → 起 agent。15 台<b>互不依赖，可以同时跑</b>。</p>
+    <p>都起来后控制机 Ctrl-C 关掉 HTTP，然后 <code>check</code> → <code>measure</code> → <code>report</code>。</p>
+
+    <div class="note">
+      <p><b>两条路可以混用。</b>ssh 通的那几台走 <code>sync</code>，剩下的手工粘 <code>cmds</code> 的命令，结果完全一样。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="n">04</span>各节点拿什么</h2>
+  <p class="lede">7 条段怎么瓜分 48 层。红线是切点 L₀=11 —— 左边前段，右边后段。</p>
+
+  <div class="map">
+    <div class="map-legend">
+      <span><i class="sw" style="background:var(--front)"></i>前段（任务无关）</span>
+      <span><i class="sw" style="background:var(--back)"></i>后段（任务相关）</span>
+      <span><i class="sw" style="background:var(--spare)"></i>备胎前段</span>
+      <span><i class="sw" style="background:var(--crit);width:3px;height:13px;border-radius:1px"></i>L₀ = 11</span>
+    </div>
+    <div id="layermap"></div>
+    <div class="map-axis">
+      <div></div>
+      <div class="axis-track" id="axis"></div>
+    </div>
+  </div>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>节点</th><th>段</th><th>角色</th><th>位置</th><th>层</th><th class="num">拉取</th></tr></thead>
+      <tbody id="nodetable"></tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <p><b>节点本身不做任何决策。</b>它不知道自己是前段还是后段 —— 这些全在 <code>plan.json</code> 里，离线就算好了。<code>fetch --node N07</code> 打开清单找到 N07 那条，只拉这一条列出的张量；<code>agent --id N07</code> 起进程监听 9101，报出自己是 N07。剩下的等控制机下发。</p>
+    <p>所以 15 条命令长得一模一样，唯一的差别是把 <code>N01</code>…<code>N15</code> 填进去两处。</p>
+  </div>
+
+  <p><b>备胎链路</b>（N12–N15）平时不接流量，只在某条前段掉了才顶上。想省 14.5 GB 可以先不部署这 4 台 —— 代价是池子没有余量，掉一条前段就直接降容量。</p>
+
+  <h3>节点自查</h3>
+  <div class="term">
+    <div class="term-head"><span class="term-where node">节点</span><button class="copy">复制</button></div>
+<pre>tail -5 /tmp/agent-N07.log      <span class="c"># 应该只有一行 listening on 0.0.0.0:9101</span>
+ss -lntp | grep 9101</pre>
+  </div>
+  <p>统一验在控制机做，不用逐台看：<code>./deploy_15.sh check</code>。</p>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <h2><span class="n">05</span>测不同的 request</h2>
+
+  <h3>测试集 <code>task/cases.txt</code></h3>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre><span class="c"># 制表符前是真实 task，用来核对在线识别对不对</span>
+mbpp	Write a python function to reverse a linked list.
+gsm8k	Natalia sold clips to 48 friends in April, and half as many in May...</pre>
+  </div>
+  <p>标注<b>只用来评分，不影响派发</b> —— 请求发到哪条后段靠前段自己识别，那才是被测的东西。不写标注也行，按轮转指派。<code>#</code> 开头与空行跳过。</p>
+  <p>制表符前的字段只有<b>在 task 列表里认识</b>时才当成标注，否则整行都是 prompt —— 代码类 prompt 里制表符是缩进，不该被误读。</p>
+  <p><code>--requests</code> 比条数多就循环重跑，少就只跑前几条。</p>
+
+  <h3>跑</h3>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>REQUESTS=40 TOKENS=64 RESULTS=results/cov70.json ./deploy_15.sh measure
+./deploy_15.sh report results/cov70.json</pre>
+  </div>
+  <p><code>measure</code> 默认 <code>WARMUP=2</code>：先跑 2 条<b>不计入结果</b>的请求。torch 首次前向要选 kernel、分配显存池、把权重从 mmap 拉进页缓存 —— 这些只发生一次，混进 p50 会把结果拖歪。</p>
+
+  <h3>看</h3>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机 · 输出</span><button class="copy">复制</button></div>
+<pre><span class="c">req    真实   识别      通道              总ms   排队  首tok  /tok   算力</span>
+req0   mbpp  mbpp  ✓  F0×Bmbpp0          33     0    15    3.5   41%
+req1   gsm8k gsm8k ✓  F1×Bgsm8k0         33     0    14    3.1   34%
+<span class="c">──────────────────────────────────────────────────────────────</span>
+  40 条：总时延 p50 25ms，逐 token p50 2.8ms，算力使用率均值 42.1%，识别 98%
+
+  <span class="k">时延构成（均值）</span>
+    计算              10ms  41.0%  ████████████████
+    排队               0ms   0.0%
+    网络+协议+调度      15ms  59.0%  ████████████████████████
+
+  <span class="k">各节点算力占比（占总时延，均值）</span>
+    N07   F0      层 2–10   121 专家  30.6%  ██████████████████
+    N04   Bmbpp0  层 21–48  121 专家  13.1%  ████████</pre>
+  </div>
+
+  <h3>怎么读这张表</h3>
+  <div class="note warn">
+    <p><b>「网络+协议+调度」是反推的上界，不是测量值。</b>15 台没有时钟同步，跨机的绝对时刻拼不到一条轴上，所以它 = 总时延 − 各节点计算 − 排队。三段相加恒等于总时延，这张表不会骗人，但那一栏里混着协议开销和调度延迟，不能当纯网络时间读。</p>
+  </div>
+  <p><b>算力使用率的分母是墙钟，不是「节点数 × 墙钟」。</b>这条路上的节点是流水线，同一时刻只有一个在算（段内逐跳、跨段绕环）。所以这个比值的含义是「这条请求的生命周期里，有多少时间真的在做矩阵乘」—— 40% 不代表浪费了 60% 的卡。</p>
+  <p><b>算力使用率低时先看各节点占比</b>，是不是某一跳独吞。层数分得不均（比如 N04 拿了 28 层而 N03 只有 9 层）会让流水线卡在长的那一段。</p>
+  <p><b>识别准确率与换绑次数</b>是动态模式独有的。换绑 = 前段先识别错了、miss 报警后改派到另一个后段。换绑多说明分类器在这批 prompt 上不灵。</p>
+
+  <h3>落盘的 JSON</h3>
+  <p><code>results/run.json</code> 里逐请求都有：时序四段拆解、每个 token 的耗时、各节点计算时长与发出字节、识别置信度与判定区、生成的完整文本。测完有一份可复算的底稿，不用回头翻滚屏日志。</p>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <h2><span class="n">06</span>横向对比</h2>
+
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre><span class="c"># 换覆盖率</span>
+<span class="k">for</span> c <span class="k">in</span> 0.70 0.80 0.90; <span class="k">do</span>
+  COVERAGE=$c RESULTS=results/cov$c.json ./deploy_15.sh measure
+<span class="k">done</span>
+
+<span class="c"># 换 miss 策略（serve 后面的参数会透传给 control.py）</span>
+./deploy_15.sh measure --miss-policy drop_noscale
+./deploy_15.sh measure --miss-policy local_topk
+
+<span class="c"># 每条 path 只跑一个 request</span>
+./deploy_15.sh measure --concurrency 1</pre>
+  </div>
+
+  <h3>三种 miss 策略</h3>
+  <p>后段没装全被路由到的专家时怎么办：</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>策略</th><th>做法</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">drop</td><td>丢掉缺的，门控权重重归一</td></tr>
+        <tr><td class="mono">drop_noscale</td><td>丢掉缺的，<b>不</b>重归一（实测更好）</td></tr>
+        <tr><td class="mono">local_topk</td><td>在驻留集里重新取 top-k</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <p><b>改 <code>COVERAGE</code> 是真的改了后段驻留集</b>，每轮会重新装载专家，那几分钟躲不掉。只改 <code>cases.txt</code> 和 <code>REQUESTS</code> 的话重跑就快得多。</p>
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+  <h2><span class="n">07</span>改了代码之后</h2>
+  <p><code>start</code> 只是 <code>cd $WORKDIR &amp;&amp; python -m ...</code>，<b>它不会推代码</b>。</p>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>./deploy_15.sh stop &amp;&amp; ./deploy_15.sh sync &amp;&amp; ./deploy_15.sh start</pre>
+  </div>
+  <div class="note warn">
+    <p>漏了 <code>sync</code> 的话跑的还是旧代码，<b>而且不会报错</b> —— 这是最容易踩的坑。</p>
+  </div>
+  <p>没 ssh 的话重跑 <code>bootstrap</code> + 各节点重粘一次命令（权重已经在本地，<code>fetch</code> 会跳过已有的）。</p>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="s8">
+  <h2><span class="n">08</span>排错</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>症状</th><th>原因与处理</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">✗ 必须设 ADVERTISE</td><td>见 <a href="#s2">§02</a></td></tr>
+        <tr><td class="mono">规划失败: 公共中值域人口 0</td><td>节点之间延迟差异太小（比如全在一台机器上模拟），公共中值域退化。真机上不会遇到；本地演练加 <code>--mem-cap-mb</code></td></tr>
+        <tr><td class="mono">没有 L₀ 同时满足 p ≥ 0.8…</td><td>内存上限太紧，前段单节点装不下。真机上 24 GB 卡装 L₀=11 的前段（14.5 GB）是够的</td></tr>
+        <tr><td>某台 agent 没起来</td><td><code>tail /tmp/agent-N07.log</code>。最常见是 <code>--out</code> 目录没权限，或 torch 装的是 CPU 版而 <code>--device cuda:0</code></td></tr>
+        <tr><td class="mono">节点上报的错误</td><td>通常是权重缺张量。让那台重跑一次 <code>fetch</code>（会跳过已有的，只补缺的）</td></tr>
+        <tr><td>请求超时</td><td><code>report</code> 里看 <code>missing_traces</code>：哪台没上报埋点。没上报的节点，它的计算时间会被算进「网络」那一栏</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="s9">
+  <h2><span class="n">09</span>都在 NAT 后面</h2>
+  <p>节点之间两两连不通时，起一台中继：</p>
+  <div class="term">
+    <div class="term-head"><span class="term-where node">一台双方都能连到的机器</span><button class="copy">复制</button></div>
+<pre>python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200</pre>
+  </div>
+  <p>各节点的 agent 和控制机的 control 都加 <code>--relay &lt;中继IP&gt;:9200</code>。</p>
+  <p>中继握手完就<b>只搬字节，不认识 p2pmoe 的协议</b> —— 上层完全分辨不出中间隔了一台机器。代价是每跳绕一圈，逐 token 延迟大致翻倍。</p>
+</section>
+
+<!-- ============ appendix ============ -->
+<section id="sa">
+  <h2><span class="n">──</span>命令速查</h2>
+  <p>全部在<b>控制机</b>上跑。</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>命令</th><th>做什么</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">sync</td><td>rsync 代码 + 装依赖到 15 台（要 ssh）</td></tr>
+        <tr><td class="mono">bootstrap</td><td>起 HTTP 服务发代码（不要 ssh）</td></tr>
+        <tr><td class="mono">cmds [节点]</td><td>打印每台该跑的命令</td></tr>
+        <tr><td class="mono">check</td><td>ssh 可达 + agent 在线 + 两两可达</td></tr>
+        <tr><td class="mono">fetch</td><td>各节点只拉自己那份权重</td></tr>
+        <tr><td class="mono">start</td><td>起 15 个 agent</td></tr>
+        <tr><td class="mono">serve</td><td>建链 + 打请求</td></tr>
+        <tr><td class="mono">measure</td><td>同上 + 预热 + 逐请求时序</td></tr>
+        <tr><td class="mono">report [文件]</td><td>把结果 JSON 读成表</td></tr>
+        <tr><td class="mono">stop</td><td>停 15 个 agent</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>配置项</h3>
+  <p>环境变量覆盖，或改脚本顶部。</p>
+  <div class="term">
+    <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
+<pre>HOSTS=task/hosts.txt            PLAN=task/plan_deploy.json
+PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
+WEIGHTS=/data/qwen3-next-part   WORKDIR=/opt/p2pmoe
+ADVERTISE=<span class="s">&lt;必填&gt;</span>                DEVICE=cuda:0
+COVERAGE=0.70                   TASKS=mbpp=5,gsm8k=3
+TOKENS=64   REQUESTS=20   WARMUP=2
+PROMPTS=task/cases.txt          RESULTS=results/run.json
+SSH_USER=   SSH_OPTS=   BOOT_PORT=9300   HF_ENDPOINT=</pre>
+  </div>
+</section>
+
+<footer>
+  仓库里同一份内容在 <code>RUNBOOK.md</code>，设计与取舍在 <code>DEPLOY.md</code>，算法在 <code>task.docx</code>。
+</footer>
+
+</main>
+</div>
+</div>
+
+<script>
+const NODES = [
+  {id:"N01", seg:"F0",         role:"front",         pos:"1/3 段首", a:1,  b:1,  gb:1.7,  k:"f"},
+  {id:"N07", seg:"F0",         role:"front",         pos:"2/3",      a:2,  b:10, gb:11.9, k:"f"},
+  {id:"N10", seg:"F0",         role:"front",         pos:"3/3 段尾", a:11, b:11, gb:0.9,  k:"f"},
+  {id:"N11", seg:"F1",         role:"front",         pos:"1/1 独占", a:1,  b:11, gb:14.5, k:"f"},
+  {id:"N09", seg:"F2",         role:"front",         pos:"1/1 独占", a:1,  b:11, gb:14.5, k:"f"},
+  {id:"N13", seg:"F-standby0", role:"front-standby", pos:"1/4 段首", a:1,  b:8,  gb:11.6, k:"s"},
+  {id:"N14", seg:"F-standby0", role:"front-standby", pos:"2/4",      a:9,  b:9,  gb:1.1,  k:"s"},
+  {id:"N15", seg:"F-standby0", role:"front-standby", pos:"3/4",      a:10, b:10, gb:0.9,  k:"s"},
+  {id:"N12", seg:"F-standby0", role:"front-standby", pos:"4/4 段尾", a:11, b:11, gb:0.9,  k:"s"},
+  {id:"N03", seg:"Bmbpp0",     role:"back:mbpp",     pos:"1/2 段首", a:12, b:20, gb:7.3,  k:"b"},
+  {id:"N04", seg:"Bmbpp0",     role:"back:mbpp",     pos:"2/2 段尾", a:21, b:48, gb:21.8, k:"b"},
+  {id:"N05", seg:"Bmbpp1",     role:"back:mbpp",     pos:"1/2 段首", a:12, b:20, gb:7.3,  k:"b"},
+  {id:"N02", seg:"Bmbpp1",     role:"back:mbpp",     pos:"2/2 段尾", a:21, b:48, gb:21.8, k:"b"},
+  {id:"N06", seg:"Bgsm8k0",    role:"back:gsm8k",    pos:"1/2 段首", a:12, b:14, gb:1.6,  k:"b"},
+  {id:"N08", seg:"Bgsm8k0",    role:"back:gsm8k",    pos:"2/2 段尾", a:15, b:48, gb:22.4, k:"b"},
+];
+const L = 48, L0 = 11;
+const pct = n => (n / L) * 100;
+
+// ---- 层区间图：一行一条段，段内节点相邻 ---- //
+const order = ["F0","F1","F2","F-standby0","Bmbpp0","Bmbpp1","Bgsm8k0"];
+document.getElementById("layermap").innerHTML = order.map(sid => {
+  const ns = NODES.filter(n => n.seg === sid).sort((x, y) => x.a - y.a);
+  const bars = ns.map(n => {
+    const w = pct(n.b - n.a + 1);
+    return `<div class="seg ${n.k}" style="left:${pct(n.a-1)}%;width:${w}%"
+      title="${n.id} · 层 ${n.a}–${n.b} · ${n.gb} GB">${w > 7 ? n.id : ""}</div>`;
+  }).join("");
+  return `<div class="map-row">
+    <div class="map-lab">${sid}</div>
+    <div class="map-track">${bars}<div class="cut" style="left:${pct(L0)}%"></div></div>
+  </div>`;
+}).join("");
+
+document.getElementById("axis").innerHTML =
+  [1, 11, 20, 30, 40, 48].map(v =>
+    `<i style="left:${pct(v - .5)}%">${v}</i>`).join("");
+
+// ---- 节点表 ---- //
+const ROLE = {"front":"前段", "front-standby":"备胎前段",
+              "back:mbpp":"后段 mbpp", "back:gsm8k":"后段 gsm8k"};
+document.getElementById("nodetable").innerHTML =
+  [...NODES].sort((x, y) => x.id.localeCompare(y.id)).map(n => `<tr>
+    <td class="id">${n.id}</td>
+    <td class="mono">${n.seg}</td>
+    <td><span class="chip ${n.k}">${ROLE[n.role]}</span></td>
+    <td>${n.pos}</td>
+    <td class="mono">${n.a}–${n.b}</td>
+    <td class="num">${n.gb.toFixed(1)} GB</td>
+  </tr>`).join("");
+
+// ---- 复制 ---- //
+document.querySelectorAll(".copy").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const pre = btn.closest(".term").querySelector("pre");
+    try {
+      await navigator.clipboard.writeText(pre.innerText);
+      btn.textContent = "已复制"; btn.classList.add("done");
+    } catch { btn.textContent = "手动选中复制"; }
+    setTimeout(() => { btn.textContent = "复制"; btn.classList.remove("done"); }, 1800);
+  });
+});
+
+// ---- 引导方式切换（记住选择） ---- //
+const tabs = [...document.querySelectorAll('.paths button')];
+function pick(id, save) {
+  tabs.forEach(t => {
+    const on = t.id === id;
+    t.setAttribute("aria-selected", on ? "true" : "false");
+    document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+  });
+  if (save) { try { localStorage.setItem("bootpath", id); } catch {} }
+}
+tabs.forEach(t => t.addEventListener("click", () => pick(t.id, true)));
+try {
+  const saved = localStorage.getItem("bootpath");
+  if (saved && tabs.some(t => t.id === saved)) pick(saved, false);
+} catch {}
+
+// ---- 目录高亮 ---- //
+const links = new Map([...document.querySelectorAll("nav a")]
+  .map(a => [a.getAttribute("href").slice(1), a]));
+const seen = new Set();
+const io = new IntersectionObserver(es => {
+  es.forEach(e => e.isIntersecting ? seen.add(e.target.id) : seen.delete(e.target.id));
+  const first = [...links.keys()].find(id => seen.has(id));
+  links.forEach((a, id) => a.classList.toggle("on", id === first));
+}, { rootMargin: "-10% 0px -70% 0px" });
+document.querySelectorAll("section").forEach(s => io.observe(s));
+</script>

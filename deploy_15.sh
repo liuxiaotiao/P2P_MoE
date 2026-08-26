@@ -43,6 +43,7 @@ TOKENS=${TOKENS:-64}
 REQUESTS=${REQUESTS:-20}
 PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
 RESULTS=${RESULTS:-results/run.json}            # 逐请求结果落盘
+WARMUP=${WARMUP:-2}                             # measure 前丢掉几条（冷启动）
 # ---------------------------------------------------------------------------
 
 PY=${PY:-python3}
@@ -257,8 +258,9 @@ cmd_serve() {
 
 cmd_measure() {
   say "5'. 服务 + 逐请求时序"
-  echo "  --warmup 不是可选的：torch 首次前向含 kernel 选择，不预热量到的是冷启动"
-  cmd_serve --verbose
+  echo "  预热 $WARMUP 条再计时：torch 首次前向含 kernel 选择、显存池分配、"
+  echo "  权重进页缓存 —— 只发生一次，混进 p50 会把结果拖歪"
+  cmd_serve --warmup "$WARMUP" --verbose
 }
 
 # 把 --save-results 落下来的 JSON 读成一张表。测完看这个，不用翻滚屏日志。
