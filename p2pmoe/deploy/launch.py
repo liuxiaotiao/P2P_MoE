@@ -72,10 +72,37 @@ def read_hosts(path: Path) -> list[Host]:
 
 
 # --------------------------------------------------------------------------- #
-def _ssh(h: Host, cmd: str, *, ssh: str, user: str | None) -> tuple[bool, str]:
+def _brief(msg: str, width: int = 200) -> str:
+    """把多行输出压成一行，**保留头部**。
+
+    以前是 `msg[-160:]` —— 留尾巴。可失败原因几乎总在开头：
+    「读不到 https://… 的 config.json：SSL EOF」被切成「ingface.co/…/main」，
+    读的人看到的是半截 URL，看不出这是个网络错误。
+    """
+    lines = [x.strip() for x in msg.strip().splitlines() if x.strip()]
+    if not lines:
+        return "（没有输出）"
+    head = lines[0]
+    if len(lines) > 1:
+        head += f"  … +{len(lines) - 1} 行（末行：{lines[-1][:60]}）"
+    return head if len(head) <= width else head[:width - 1] + "…"
+
+
+def _ssh(h: Host, cmd: str, *, ssh: str, user: str | None,
+         timeout: float = 60.0) -> tuple[bool, str]:
+    """在 h 上跑一条命令。
+
+    `timeout` 默认 60 秒 —— 那是给 start/stop/status 这类**控制命令**的。
+    下载不能用这个数：单台最多要拉 22GB，60 秒必然超时，而超时抛出的
+    `TimeoutExpired` 消息里是一整串 argv，读起来完全不像「超时了」。
+    """
     target = f"{user}@{h.host}" if user else h.host
-    r = subprocess.run(shlex.split(ssh) + [target, cmd],
-                       capture_output=True, text=True, timeout=60)
+    try:
+        r = subprocess.run(shlex.split(ssh) + [target, cmd],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, (f"ssh 超过 {timeout:.0f}s 没返回。"
+                       f"下载类命令要给足时间：--timeout <秒>")
     return r.returncode == 0, (r.stdout or r.stderr).strip()
 
 
@@ -283,7 +310,8 @@ def _fetch_all(hosts, args) -> int:
                                    capture_output=True, text=True)
                 return h, r.returncode == 0, (r.stdout or r.stderr).strip()[-200:]
             full = f"cd {shlex.quote(args.workdir)} && {cmd_for(h)}"
-            return (h, *_ssh(h, full, ssh=args.ssh, user=args.user))
+            return (h, *_ssh(h, full, ssh=args.ssh, user=args.user,
+                             timeout=args.timeout))
         except Exception as e:
             return h, False, f"{type(e).__name__}: {e}"[:200]
 
@@ -292,7 +320,7 @@ def _fetch_all(hosts, args) -> int:
         rows = list(ex.map(run_one, hosts))
     n_ok = 0
     for h, ok, msg in rows:
-        print(f"  {h.node_id:<8} {'✓' if ok else '✗'} {msg[-160:]}")
+        print(f"  {h.node_id:<8} {'✓' if ok else '✗'} {_brief(msg)}")
         n_ok += ok
     print(f"\nfetch: {n_ok}/{len(hosts)} 成功")
     if n_ok == len(hosts):
@@ -321,6 +349,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--local", action="store_true",
                     help="不走 ssh，在本机执行（用于同机演练与自测）")
     ap.add_argument("--parallel", type=int, default=16)
+    ap.add_argument("--timeout", type=float, default=4 * 3600, metavar="秒",
+                    help="fetch 的单节点超时。默认 4 小时 —— 单台最多拉 22GB，"
+                         "控制命令那套 60 秒的口径在这里必然超时")
     ap.add_argument("--k", type=int, default=8, help="probe 的采样次数")
     # fetch 子命令用
     ap.add_argument("--plan", type=Path, help="部署清单 JSON（fetch 用）")
@@ -406,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         rows = list(ex.map(run_one, hosts))
     n_ok = 0
     for h, ok, msg in rows:
-        print(f"  {h.node_id:<8} {h.host:<16} {'✓' if ok else '✗'} {msg}")
+        print(f"  {h.node_id:<8} {h.host:<16} {'✓' if ok else '✗'} {_brief(msg)}")
         n_ok += ok
     print(f"\n{args.action}: {n_ok}/{len(hosts)} 成功")
 

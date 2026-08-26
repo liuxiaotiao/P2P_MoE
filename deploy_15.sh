@@ -57,6 +57,8 @@ COVERAGE=${COVERAGE:-0.70}
 TASKS=${TASKS:-mbpp=5,gsm8k=3}
 TOKENS=${TOKENS:-64}
 REQUESTS=${REQUESTS:-20}
+MODE=${MODE:-slice}                             # slice=逐张量；shard=整分片（源站不支持 Range 时）
+FETCH_TIMEOUT=${FETCH_TIMEOUT:-14400}           # 单节点下载超时（秒）
 PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
 RESULTS=${RESULTS:-results/run.json}            # 逐请求结果落盘
 WARMUP=${WARMUP:-2}                             # measure 前丢掉几条（冷启动）
@@ -285,14 +287,51 @@ PYEOF
 
 cmd_fetch() {
   say "3. 各节点只拉自己那份权重"
+  local ep=${HF_ENDPOINT:-https://huggingface.co}
   echo "  合计约 141GB（全模型 160GB × 15 台 = 2400GB，省 94%）"
-  echo "  先看会下多少："
-  $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
-      "${SSHARG[@]}" --dry-run
+  echo "  源站 $ep"
+  echo "    ↑ **各节点**从这里拉，不是控制机。控制机的网络好不好在这里不算数。"
+  [ -z "${HF_ENDPOINT:-}" ] && \
+    echo "    国内网络多半要换：export HF_ENDPOINT=https://hf-mirror.com"
+
+  # 先用**一台**试通。141GB 下到一半才发现源站不通、或者不支持 Range，
+  # 代价是几小时；这里花几十秒就能问清楚。
+  local first; first=$(awk '{sub(/#.*/,"")} NF>=2 {print $1; exit}' "$HOSTS")
+  local firstip; firstip=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]; exit}' "$HOSTS")
+  say "3a. 先用 $first 试通源站（读文件头，不下张量）"
+  local probe out rc
+  probe="cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") -m p2pmoe.deploy.fetch \
+--plan $(printf %q "$PLAN") --node $first --out $(printf %q "$WEIGHTS") \
+--repo $(printf %q "$REPO") ${HF_ENDPOINT:+--endpoint $(printf %q "$HF_ENDPOINT")} --dry-run"
+  out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+          "${SSH_USER:+$SSH_USER@}$firstip" "$probe" </dev/null 2>&1) && rc=0 || rc=$?
+  echo "$out" | sed 's/^/    /'
+  if [ "$rc" != 0 ]; then
+    echo
+    echo "  ✗ $first 连源站就失败了 —— 15 台一起下只会失败 15 次。"
+    case "$out" in
+      *UNEXPECTED_EOF*|*"Connection reset"*|*"timed out"*)
+        echo "    这个错的形状是链路被掐断。换源："
+        echo "        export HF_ENDPOINT=https://hf-mirror.com"
+        echo "        bash ./deploy_15.sh fetch" ;;
+      *RangeNotSupported*|*"不支持 Range"*)
+        echo "    源站不支持 Range 请求 —— 「只拉需要的张量」这件事做不成。"
+        echo "    换一个支持 Range 的镜像，或者退到整分片模式（省得少但能跑）：" 
+        echo "        MODE=shard bash ./deploy_15.sh fetch" ;;
+      *"No module named"*)
+        echo "    代码不在 $WORKDIR —— 先 bash ./deploy_15.sh sync" ;;
+    esac
+    return 1
+  fi
+  echo "  ✓ 源站可达、支持 Range、清单读得通"
+
+  say "3b. 15 台一起下"
+  echo "  单台最多 22.4GB，视带宽可能要几十分钟到几小时。"
+  echo "  超时上限 ${FETCH_TIMEOUT:-14400}s（--timeout），不够就调大。"
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
       --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
+      --mode "${MODE:-slice}" --timeout "${FETCH_TIMEOUT:-14400}" \
       "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }
 
