@@ -388,6 +388,53 @@ def main(argv: list[str] | None = None) -> int:
         n_ok += ok
     print(f"\n{args.action}: {n_ok}/{len(hosts)} 成功")
 
+    if args.action == "start" and n_ok:
+        # PID **不是**存活证明 —— `setsid nohup ... &` 立刻返回 PID，进程随后
+        # 因为缺依赖、端口占用、代码不在 workdir 而死掉，start 却报了 ✓。
+        # 这里补一次真正的存活检查：等几秒，然后按 hosts 逐台探端口。
+        import socket as _sock
+        import time as _time
+
+        print("\n验活（PID 只说明 fork 成功了，不说明进程还在）…")
+        _time.sleep(5)
+        dead = []
+        for h in hosts:
+            try:
+                with _sock.create_connection((h.host, h.port), timeout=3):
+                    pass
+            except OSError:
+                dead.append(h)
+        if not dead:
+            print(f"  ✓ {len(hosts)}/{len(hosts)} 台在听 {hosts[0].port}")
+        else:
+            print(f"  ✗ {len(dead)}/{len(hosts)} 台起来就死了："
+                  f"{', '.join(h.node_id for h in dead)}")
+            print("  —— 下面是它们各自日志的最后几行（死因通常就在这里）：")
+            logf = f"{args.logdir}/agent-{{}}.log"
+            for h in dead[:5]:
+                print(f"\n  ── {h.node_id} @ {h.host} : {logf.format(h.node_id)}")
+                if args.local:
+                    try:
+                        tail = Path(logf.format(h.node_id)).read_text(
+                            encoding="utf-8", errors="replace").splitlines()[-12:]
+                    except OSError as e:
+                        tail = [f"（读不到日志：{e}）"]
+                else:
+                    ok2, out = _ssh(h, f"tail -n 12 {shlex.quote(logf.format(h.node_id))}",
+                                    ssh=args.ssh, user=args.user)
+                    tail = out.splitlines() if ok2 and out.strip() else [
+                        "（日志是空的或不存在 —— 多半是 cd $WORKDIR 就失败了，"
+                        "代码根本不在那儿）"]
+                for ln in tail:
+                    print(f"     {ln[:160]}")
+            if len(dead) > 5:
+                print(f"\n  （还有 {len(dead)-5} 台，同样看 {logf.format('<id>')}）")
+            print("\n  最常见的三个原因：")
+            print("    1. 节点上没装依赖 —— `pip3 install -r requirements-node.txt`")
+            print(f"    2. 代码不在 {args.workdir} —— 先 ./deploy_15.sh sync")
+            print(f"    3. 端口 {hosts[0].port} 被占 —— `ss -lntp | grep {hosts[0].port}`")
+            return 1
+
     if args.action == "start":
         print("\n下一步（等几秒让 agent 起完）：")
         print(f"  python -m p2pmoe.deploy.launch status --hosts {args.hosts}"

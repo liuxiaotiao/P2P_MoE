@@ -11,6 +11,7 @@
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
 #   ./deploy_15.sh report     # 把 results/run.json 读成一张人能看的表
+#   ./deploy_15.sh logs [节点] # 拉 agent 日志（起来就死时看这个）
 #   ./deploy_15.sh stop
 #   ./deploy_15.sh all        # sync → check → fetch → start → serve
 #
@@ -321,6 +322,29 @@ if miss:
 PYEOF
 }
 
+# 拉各节点的 agent 日志。agent 起来就死的时候，死因就在这里面。
+#
+#   ./deploy_15.sh logs        # 15 台各拉最后 15 行
+#   ./deploy_15.sh logs N07    # 只看一台，拉 60 行
+cmd_logs() {
+  need "$HOSTS"
+  local only=${1:-} n=15
+  [ -n "$only" ] && n=60
+  say "各节点 agent 日志（/tmp/p2pmoe/agent-<id>.log）"
+  awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS" |
+  while read -r id ip; do
+    [ -n "$only" ] && [ "$id" != "$only" ] && continue
+    printf '\n\033[1m── %s @ %s\033[0m\n' "$id" "$ip"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" \
+        "tail -n $n /tmp/p2pmoe/agent-$id.log 2>/dev/null" </dev/null \
+      | sed 's/^/   /' \
+      || echo "   （ssh 不通 —— 上机看 /tmp/p2pmoe/agent-$id.log）"
+  done
+  echo
+  echo "  日志是空的 = 进程连启动都没到，多半是 cd $WORKDIR 就失败了（代码不在那儿）"
+}
+
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
 
 case "${1:-all}" in
@@ -333,7 +357,8 @@ case "${1:-all}" in
   serve)   cmd_serve ;;
   measure) cmd_measure ;;
   report)  cmd_report "${2:-}" ;;
+  logs)    cmd_logs "${2:-}" ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|report|stop|all}"; exit 1 ;;
+  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|report|logs|stop|all}"; exit 1 ;;
 esac
