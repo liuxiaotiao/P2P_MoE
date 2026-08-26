@@ -2,13 +2,21 @@
 # ============================================================================
 # 在 15 个真实节点上部署 Qwen3-Next-80B-A3B
 #
+#   ./deploy_15.sh sync       # 有 ssh：推代码 + 装依赖到 15 台
+#   ./deploy_15.sh bootstrap  # 没 ssh：起个 HTTP 服务，打印每台该跑的一条命令
 #   ./deploy_15.sh check      # 只检查连通性与依赖，不动任何东西
 #   ./deploy_15.sh fetch      # 各节点只拉自己那份权重（合计 141GB，不是 2400GB）
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
 #   ./deploy_15.sh stop
-#   ./deploy_15.sh all        # check → fetch → start → serve
+#   ./deploy_15.sh all        # sync → check → fetch → start → serve
+#
+# 全部命令都在**控制机这一台**上跑。控制机可以是这 15 台里的任意一台，也可以是
+# 第 16 台 —— 它只需要能 ssh 到各节点、且各节点能回连它（--advertise）。
+#
+# 但代码与依赖**不会自己长到节点上**：launch start 只是 `cd $WORKDIR && python -m …`。
+# 所以第一次部署、或改了代码之后，都要先 sync。
 #
 # 放置来自 plan_deploy.json（离线用真实激活数据 + 真实拓扑算出来的）：
 #   L₀=11，前段 3 条 + 备胎 1 条，后段 mbpp 2 条 + gsm8k 1 条
@@ -38,13 +46,77 @@ AGENTS() { $PY -m p2pmoe.deploy.launch agents --hosts "$HOSTS"; }
 say() { printf '\n\033[1m══ %s\033[0m\n' "$*"; }
 need() { [ -f "$1" ] || { echo "缺文件：$1"; exit 1; }; }
 
+# 没有 ssh 时的引导：把代码打包、用 HTTP 发出去，每台节点自己拉。
+#
+# 为什么只有这一步需要特殊处理：**agent 起来之后整个控制面都是 TCP** ——
+# 采集能力、下发清单、打请求、收上报，全走 9101 与协调器端口。ssh 从头到尾
+# 只被 launch 的批量脚本用，而那是便利，不是依赖。
+#
+# 节点要能连到控制机的 $BOOT_PORT（它们本来就要能回连协调器，所以这个前提已经有了）。
+cmd_bootstrap() {
+  local port=${BOOT_PORT:-9300}
+  local ip=${ADVERTISE:-<控制机IP>}
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  say "B. 引导（无 ssh）"
+  tar czf "$tmp/p2pmoe.tar.gz" \
+      --exclude '__pycache__' --exclude '.git' --exclude '*.pyc' \
+      --exclude '.pytest_cache' --exclude '.*-logs' --exclude 'task/*.csv' .
+  cp "$PLAN" "$tmp/plan.json"
+  echo "  代码包 $(du -h "$tmp/p2pmoe.tar.gz" | cut -f1)，清单 $(du -h "$tmp/plan.json" | cut -f1)"
+  echo
+  echo "  ── 在**每台节点**上跑这一条（把 <ID> 换成该机的节点 id）─────────────"
+  cat <<EOS
+
+  ID=<ID>   # N01 … N15
+  mkdir -p $WORKDIR && cd $WORKDIR \\
+    && curl -fsSL http://$ip:$port/p2pmoe.tar.gz | tar xz \\
+    && curl -fsSL http://$ip:$port/plan.json -o /tmp/plan.json \\
+    && $PY -m pip install -q -r requirements-node.txt \\
+    && $PY -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node \$ID \\
+         --repo $REPO --out $WEIGHTS \\
+    && setsid nohup $PY -m p2pmoe.deploy.agent --id \$ID --bind 0.0.0.0:9101 \\
+         > /tmp/agent-\$ID.log 2>&1 &
+
+EOS
+  echo "  ──────────────────────────────────────────────────────────────────"
+  echo "  一条命令四件事：拉代码 → 装依赖 → **只拉本机那份权重** → 起 agent。"
+  echo "  15 台各自跑完之后，回控制机："
+  echo "      ./deploy_15.sh check     # 确认 15/15 在线、两两可达"
+  echo "      ./deploy_15.sh serve     # 之后全程 TCP，不再需要 ssh"
+  echo
+  echo "  HTTP 服务在 $ip:$port —— **Ctrl-C 结束**（等 15 台都拉完再关）"
+  cd "$tmp" && exec $PY -m http.server "$port"
+}
+
+# 代码与依赖不会自己长到节点上 —— 先把它们送过去。
+cmd_sync() {
+  say "S. 推代码 + 装依赖到 15 台"
+  command -v rsync >/dev/null || { echo "✗ 控制机没有 rsync"; exit 1; }
+  local hosts
+  hosts=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]}' "$HOSTS")
+  for h in $hosts; do
+    echo "  → $h"
+    ssh -o BatchMode=yes "${SSH_USER:+$SSH_USER@}$h" \
+        "mkdir -p '$WORKDIR' '$WEIGHTS'" </dev/null
+    rsync -az --delete \
+      --exclude '__pycache__' --exclude '.git' --exclude 'task' \
+      --exclude '*.pyc' --exclude '.pytest_cache' --exclude '.*-logs' \
+      ./ "${SSH_USER:+$SSH_USER@}$h:$WORKDIR/"
+    ssh -o BatchMode=yes "${SSH_USER:+$SSH_USER@}$h" \
+        "cd '$WORKDIR' && $PY -m pip install -q -r requirements-node.txt" </dev/null
+  done
+  echo "  ✓ 15 台都有代码与 torch/safetensors"
+  echo "  （没 ssh：手工 rsync 到各机 $WORKDIR，再各自 pip install -r requirements-node.txt）"
+}
+
 cmd_check() {
   say "0. 前置检查"
   need "$HOSTS"; need "$PLAN"; need "$PROFILE"
   [ -n "$ADVERTISE" ] || { echo "✗ 必须设 ADVERTISE=<控制机对节点可见的IP>"; exit 1; }
   $PY -c "import numpy, tokenizers, jinja2" 2>/dev/null \
     || { echo "✗ 控制机缺依赖：pip3 install -r requirements-control.txt"; exit 1; }
-  echo "  控制机依赖 ✓"
+  echo "  控制机依赖 ✓（只要 numpy+tokenizers+jinja2，**不装 torch**）"
   $PY - "$PLAN" <<'PYEOF'
 import json, sys
 m = json.load(open(sys.argv[1]))
@@ -99,12 +171,14 @@ cmd_measure() {
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS"; }
 
 case "${1:-all}" in
+  sync)      cmd_sync ;;
+  bootstrap) cmd_bootstrap ;;
   check)   cmd_check ;;
   fetch)   cmd_fetch ;;
   start)   cmd_start ;;
   serve)   cmd_serve ;;
   measure) cmd_measure ;;
   stop)    cmd_stop ;;
-  all)     cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
-  *) echo "用法: $0 {check|fetch|start|serve|measure|stop|all}"; exit 1 ;;
+  all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
+  *) echo "用法: $0 {sync|bootstrap|check|fetch|start|serve|measure|stop|all}"; exit 1 ;;
 esac
