@@ -11,7 +11,8 @@
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
 #   ./deploy_15.sh report     # 把 results/run.json 读成一张人能看的表
-#   ./deploy_15.sh logs [节点] # 拉 agent 日志（起来就死时看这个）
+#   ./deploy_15.sh logs [节点] # 拉 agent 日志
+#   ./deploy_15.sh doctor     # 逐台体检：代码/torch/权重/端口/日志
 #   ./deploy_15.sh stop
 #   ./deploy_15.sh all        # sync → check → fetch → start → serve
 #
@@ -322,7 +323,65 @@ if miss:
 PYEOF
 }
 
-# 拉各节点的 agent 日志。agent 起来就死的时候，死因就在这里面。
+# 一次问清楚每台节点到底缺什么。agent 起来就死时先跑这个。
+#
+# 为什么不是「拉日志」就够：日志**不存在**和 ssh 不通，症状看起来一样，
+# 但一个是代码没到、一个是网络问题 —— 修法完全相反。所以这里逐项分别问。
+_probe_script() {
+  local id=$1
+  cat <<EOS
+W=$WORKDIR; L=/tmp/p2pmoe/agent-$id.log; D=$WEIGHTS
+printf 'workdir  %-10s ' "\$W"; [ -d "\$W" ] && echo ok || echo '✗ 目录不存在'
+printf 'package  %-10s ' 'p2pmoe/'; [ -f "\$W/p2pmoe/deploy/agent.py" ] && echo ok || echo '✗ 代码不在这儿'
+printf 'python   %-10s ' ''; $PY -V 2>&1 | head -1
+printf 'torch    %-10s ' ''; $PY -c 'import torch;print(torch.__version__, "cuda" if torch.cuda.is_available() else "CPU-only")' 2>/dev/null || echo '✗ 没装'
+printf 'weights  %-10s ' "\$D"; [ -d "\$D" ] && echo "ok (\$(du -sh "\$D" 2>/dev/null | cut -f1))" || echo '✗ 没拉过'
+printf 'port     %-10s ' '9101'; (ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -q ':9101 ' && echo '在听' || echo '空闲'
+printf 'log      %-10s ' "\$L"; if [ -f "\$L" ]; then echo "\$(wc -l < "\$L") 行"; else echo '✗ 不存在（进程连启动都没到）'; fi
+[ -s "\$L" ] && { echo '--- 日志末尾 ---'; tail -n 8 "\$L"; }
+exit 0
+EOS
+}
+
+# 逐台体检。ssh 失败与「远端某项缺失」分开报 —— 它们的修法相反。
+cmd_doctor() {
+  need "$HOSTS"
+  local only=${1:-}
+  say "节点体检"
+  local d; d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  local ids=()
+  while read -r id ip; do
+    [ -n "$only" ] && [ "$id" != "$only" ] && continue
+    ids+=("$id:$ip")
+    ( _probe_script "$id" | ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" 'sh -s' > "$d/$id.out" 2> "$d/$id.err"
+      echo $? > "$d/$id.rc" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+
+  local nossh=0 nocode=0 notorch=0
+  for e in "${ids[@]}"; do
+    local id=${e%%:*} ip=${e#*:}
+    printf '\n\033[1m── %s @ %s\033[0m\n' "$id" "$ip"
+    if [ "$(cat "$d/$id.rc" 2>/dev/null)" != 0 ]; then
+      echo "   ✗ ssh 连不上：$(head -1 "$d/$id.err" 2>/dev/null)"
+      nossh=$((nossh+1)); continue
+    fi
+    sed 's/^/   /' "$d/$id.out"
+    grep -q '代码不在这儿' "$d/$id.out" && nocode=$((nocode+1))
+    grep -q "torch.*✗" "$d/$id.out" && notorch=$((notorch+1))
+  done
+
+  echo
+  say "结论"
+  [ "$nossh"   -gt 0 ] && echo "  · $nossh 台 ssh 连不上 —— 检查 SSH_USER/SSH_OPTS，或走 ./deploy_15.sh bootstrap"
+  [ "$nocode"  -gt 0 ] && echo "  · $nocode 台没有代码 —— ./deploy_15.sh sync"
+  [ "$notorch" -gt 0 ] && echo "  · $notorch 台没装 torch —— sync 会顺带装（它跑 pip install -r requirements-node.txt）"
+  [ "$nossh$nocode$notorch" = "000" ] && echo "  · 每台该有的都有了。agent 还是起不来的话，看上面各自的日志末尾。"
+  return 0
+}
+
+# 拉各节点的 agent 日志。
 #
 #   ./deploy_15.sh logs        # 15 台各拉最后 15 行
 #   ./deploy_15.sh logs N07    # 只看一台，拉 60 行
@@ -331,18 +390,30 @@ cmd_logs() {
   local only=${1:-} n=15
   [ -n "$only" ] && n=60
   say "各节点 agent 日志（/tmp/p2pmoe/agent-<id>.log）"
-  awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS" |
+  local miss=0 nossh=0 got=0
   while read -r id ip; do
     [ -n "$only" ] && [ "$id" != "$only" ] && continue
     printf '\n\033[1m── %s @ %s\033[0m\n' "$id" "$ip"
-    ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
-        "${SSH_USER:+$SSH_USER@}$ip" \
-        "tail -n $n /tmp/p2pmoe/agent-$id.log 2>/dev/null" </dev/null \
-      | sed 's/^/   /' \
-      || echo "   （ssh 不通 —— 上机看 /tmp/p2pmoe/agent-$id.log）"
-  done
+    local out rc
+    # **分开判**：ssh 失败 与 日志不存在 是两回事。以前把它们混成一句
+    # 「ssh 不通」，于是「代码没同步过去」被误报成网络问题。
+    out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+            "${SSH_USER:+$SSH_USER@}$ip" \
+            "if [ -f /tmp/p2pmoe/agent-$id.log ]; then tail -n $n /tmp/p2pmoe/agent-$id.log; \
+             else echo __NOLOG__; fi" </dev/null 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != 0 ]; then
+      echo "   ✗ ssh 连不上：$(echo "$out" | head -1)"; nossh=$((nossh+1))
+    elif [ "$out" = "__NOLOG__" ]; then
+      echo "   ✗ 日志不存在 —— 进程连启动都没到（cd $WORKDIR 就失败了）"; miss=$((miss+1))
+    else
+      echo "$out" | sed 's/^/   /'; got=$((got+1))
+    fi
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
   echo
-  echo "  日志是空的 = 进程连启动都没到，多半是 cd $WORKDIR 就失败了（代码不在那儿）"
+  [ "$nossh" -gt 0 ] && echo "  $nossh 台 ssh 连不上。"
+  [ "$miss"  -gt 0 ] && echo "  $miss 台没有日志 —— 说明 \`cd $WORKDIR\` 就失败了，代码根本不在那儿。先 ./deploy_15.sh sync"
+  [ "$got"   -gt 0 ] && echo "  $got 台有日志，死因见上面各自的末尾几行。"
+  return 0
 }
 
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
@@ -358,7 +429,8 @@ case "${1:-all}" in
   measure) cmd_measure ;;
   report)  cmd_report "${2:-}" ;;
   logs)    cmd_logs "${2:-}" ;;
+  doctor)  cmd_doctor "${2:-}" ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|report|logs|stop|all}"; exit 1 ;;
+  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|report|logs|doctor|stop|all}"; exit 1 ;;
 esac

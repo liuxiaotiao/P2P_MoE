@@ -420,11 +420,21 @@ def main(argv: list[str] | None = None) -> int:
                     except OSError as e:
                         tail = [f"（读不到日志：{e}）"]
                 else:
-                    ok2, out = _ssh(h, f"tail -n 12 {shlex.quote(logf.format(h.node_id))}",
-                                    ssh=args.ssh, user=args.user)
-                    tail = out.splitlines() if ok2 and out.strip() else [
-                        "（日志是空的或不存在 —— 多半是 cd $WORKDIR 就失败了，"
-                        "代码根本不在那儿）"]
+                    # ssh 失败 与 日志不存在 是两回事 —— 前者是网络，后者是
+                    # 代码没到。tail 对缺文件返回非零，混在一起会把「没同步」
+                    # 误报成「连不上」，修法正好相反。
+                    lp = shlex.quote(logf.format(h.node_id))
+                    ok2, out = _ssh(
+                        h, f"if [ -s {lp} ]; then tail -n 12 {lp}; "
+                           f"else echo __NOLOG__; fi",
+                        ssh=args.ssh, user=args.user)
+                    if not ok2:
+                        tail = [f"（ssh 连不上：{out.splitlines()[0] if out else ''}）"]
+                    elif out.strip() == "__NOLOG__":
+                        tail = [f"（日志不存在 —— 进程连启动都没到，"
+                                f"`cd {args.workdir}` 就失败了，代码不在那儿）"]
+                    else:
+                        tail = out.splitlines()
                 for ln in tail:
                     print(f"     {ln[:160]}")
             if len(dead) > 5:
