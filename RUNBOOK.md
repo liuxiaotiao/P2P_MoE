@@ -57,7 +57,15 @@
 ```bash
 cd /path/to/p2p-framework
 pip3 install -r requirements-control.txt      # numpy + tokenizers + jinja2
+./deploy_15.sh meta                            # 取 config + tokenizer（约 10MB）
 ```
+
+`meta` 那一步容易被跳过。控制机与节点**共用 `--model-dir` 这一个路径**，但要的东西
+不一样：节点要权重（几十 GB），控制机一个张量都不碰 —— 只用 `config.json` 算模型
+规格、用 tokenizer 把 prompt 编成 id 再把 id 解回文本。
+
+而权重是**各节点自己拉的，不经过控制机**，所以控制机上那个目录默认是空的。
+症状是 `serve` 一上来就报 `/data/xxx/config.json 不存在`。
 
 写 `task/hosts.txt`：
 
@@ -290,9 +298,16 @@ for c in 0.70 0.80 0.90; do
   COVERAGE=$c RESULTS=results/cov$c.json ./deploy_15.sh measure
 done
 
-# 换 miss 策略（serve 后面的参数会透传给 control.py）
+# 换 miss 策略
 ./deploy_15.sh measure --miss-policy drop_noscale
 ./deploy_15.sh measure --miss-policy local_topk
+```
+
+`serve` / `measure` 后面多写的参数**原样透传给 `control.py`**，argparse 取最后一次
+出现，所以透传的值会盖掉脚本里设的默认值：
+
+```bash
+./deploy_15.sh measure --coverage 0.60 --tasks mbpp=4,gsm8k=4
 
 # 换并发
 ./deploy_15.sh measure --concurrency 1     # 每条 path 只跑一个 request
@@ -325,6 +340,14 @@ done
 ---
 
 ## 8. 常见问题
+
+**`/data/xxx/config.json 不存在`** —— 控制机也要这个目录，但只要里面的
+`config.json` 与 tokenizer（约 10MB），**不要权重**。跑 `./deploy_15.sh meta`。
+
+**某个 task 分到 0 条后段** —— 规划器按内存与跳数约束分**整数条**通道，配额不够时
+会给某个 task 分到 0。这是离散配平的正常结果。`serve` 现在会在开跑前拦住并点名。
+降 `--coverage`、调 `--tasks` 的到达比、或加节点。注意覆盖率与通道数**不是单调的**
+（段的组成是离散的、跳数是整数），0.60 未必比 0.70 建得多 —— 挨个试比推理快。
 
 **`✗ 必须设 ADVERTISE`** —— 见 §2。
 
@@ -373,6 +396,7 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 | `./deploy_15.sh cmds [节点]` | 控制机 | 打印每台该跑的命令 |
 | `./deploy_15.sh check` | 控制机 | ssh 可达 + agent 在线 + 两两可达 |
 | `./deploy_15.sh fetch` | 控制机 | 各节点只拉自己那份权重 |
+| `./deploy_15.sh meta` | 控制机 | 取 config + tokenizer（10MB，不含权重） |
 | `./deploy_15.sh start` | 控制机 | 起 15 个 agent |
 | `./deploy_15.sh serve` | 控制机 | 建链 + 打请求 |
 | `./deploy_15.sh measure` | 控制机 | 同上 + 预热 + 逐请求时序 |

@@ -337,7 +337,19 @@ def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetu
     d = Path(args.model_dir)
     cfg_f = d / "config.json"
     if not cfg_f.exists():
-        raise SystemExit(f"{cfg_f} 不存在 —— --model-dir 要指向 HF checkpoint 目录")
+        # 控制机与节点共用 --model-dir 这一个路径，但**要的东西不一样**：
+        # 节点要权重（几十 GB），控制机只要 config.json 与 tokenizer（约 10MB）——
+        # 它一个张量都不碰，只用 config 算模型规格、用 tokenizer 编解码文本。
+        # 所以控制机上这个目录经常是空的：权重是各节点自己拉的，没经过这里。
+        raise SystemExit(
+            f"{cfg_f} 不存在。\n"
+            f"  控制机也需要这个目录 —— 但只要里面的 config.json 与 tokenizer"
+            f"（约 10MB），**不要权重**。\n"
+            f"  取一份：\n"
+            f"      ./deploy_15.sh meta\n"
+            f"  或者：\n"
+            f"      python3 -m p2pmoe.deploy.fetch --meta-only \\\n"
+            f"          --repo <HF仓库> --out {d}")
     hf = json.loads(cfg_f.read_text(encoding="utf-8"))
     spec, info = model_spec_from_hf(hf, name=d.name, ctx_max=args.ctx,
                                     dtype_bytes=args.dtype_bytes)

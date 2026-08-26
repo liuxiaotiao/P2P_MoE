@@ -7,6 +7,7 @@
 #   ./deploy_15.sh cmds       # 逐台打印它自己该跑的命令（层区间/拉取量各不同）
 #   ./deploy_15.sh check      # 只检查连通性与依赖，不动任何东西
 #   ./deploy_15.sh fetch      # 各节点只拉自己那份权重（合计 141GB，不是 2400GB）
+#   ./deploy_15.sh meta       # 控制机取 config+tokenizer（10MB，不含权重）
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
@@ -249,6 +250,13 @@ PYEOF
   rm -rf "$d"
   [ "$bad" -eq 0 ] || echo "  （$bad 台不通。改用 ./deploy_15.sh bootstrap 走无 ssh 那条路）"
 
+  if [ ! -f "$WEIGHTS/config.json" ]; then
+    echo "  ✗ 控制机缺 $WEIGHTS/config.json —— 跑 ./deploy_15.sh meta（约 10MB）"
+    echo "    （控制机只要 config 与 tokenizer，不要权重）"
+  else
+    echo "  控制机元数据 ✓ $WEIGHTS/config.json"
+  fi
+
   say "2. 节点在线与两两可达"
   $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS" "${SSHARG[@]}" || true
   echo "  —— 数据面是节点**直接互发**，控制机不在中间。下面查两两可达："
@@ -294,7 +302,7 @@ cmd_measure() {
   say "5'. 服务 + 逐请求时序"
   echo "  预热 $WARMUP 条再计时：torch 首次前向含 kernel 选择、显存池分配、"
   echo "  权重进页缓存 —— 只发生一次，混进 p50 会把结果拖歪"
-  cmd_serve --warmup "$WARMUP" --verbose
+  cmd_serve --warmup "$WARMUP" --verbose "$@"
 }
 
 # 把 --save-results 落下来的 JSON 读成一张表。测完看这个，不用翻滚屏日志。
@@ -483,21 +491,40 @@ cmd_logs() {
   return 0
 }
 
+# 控制机也需要 $WEIGHTS 这个目录 —— 但只要里面的 config.json 与 tokenizer。
+#
+# 它一个张量都不碰：用 config 算模型规格（层数、专家数、切点的内存账），
+# 用 tokenizer 把 prompt 编成 id、把 id 解回文本。权重是各节点自己拉的，
+# 不经过控制机。所以这里只要约 10MB，不是 141GB。
+cmd_meta() {
+  say "M. 控制机取模型元数据（约 10MB，不含权重）"
+  $PY -m p2pmoe.deploy.fetch --meta-only --repo "$REPO" --out "$WEIGHTS" \
+      ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
+}
+
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
 
-case "${1:-all}" in
+# serve / measure 后面多写的参数**原样透传给 control.py**，例如
+#     ./deploy_15.sh measure --coverage 0.60 --miss-policy drop_noscale
+# argparse 取最后一次出现，所以透传的值会盖掉脚本里设的默认值。
+action=${1:-all}
+shift 2>/dev/null || true
+
+case "$action" in
   sync)      cmd_sync ;;
   bootstrap) cmd_bootstrap ;;
-  cmds)      cmd_cmds "${2:-}" ;;
+  cmds)      cmd_cmds "${1:-}" ;;
   check)   cmd_check ;;
   fetch)   cmd_fetch ;;
+  meta)    cmd_meta ;;
   start)   cmd_start ;;
-  serve)   cmd_serve ;;
-  measure) cmd_measure ;;
-  report)  cmd_report "${2:-}" ;;
-  logs)    cmd_logs "${2:-}" ;;
-  doctor)  cmd_doctor "${2:-}" ;;
+  serve)   cmd_serve "$@" ;;
+  measure) cmd_measure "$@" ;;
+  report)  cmd_report "${1:-}" ;;
+  logs)    cmd_logs "${1:-}" ;;
+  doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop ;;
-  all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|report|logs|doctor|stop|all}"; exit 1 ;;
+  all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|start|serve|measure|report|logs|doctor|stop|all}
+       serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

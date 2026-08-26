@@ -406,13 +406,19 @@ def main(argv: list[str] | None = None) -> int:
                     help="HF 镜像地址（也可用 HF_ENDPOINT 环境变量）")
     ap.add_argument("--base-url", default=None, help="任意 base URL（自建权重服务）")
     ap.add_argument("--src", default=None, help="本地目录（共享存储/已下好的全量）")
-    ap.add_argument("--plan", type=Path, required=True, help="部署清单 JSON")
-    ap.add_argument("--node", required=True, help="本机在清单里的节点 id")
+    ap.add_argument("--plan", type=Path, default=None,
+                    help="部署清单 JSON（--meta-only 时不需要）")
+    ap.add_argument("--node", default=None,
+                    help="本机在清单里的节点 id（--meta-only 时不需要）")
     ap.add_argument("--out", type=Path, required=True, help="拼好的 checkpoint 放哪")
     ap.add_argument("--mode", choices=("slice", "shard"), default="slice",
                     help="slice=逐张量（省得多，要 Range 支持）；shard=整分片（兜底）")
     ap.add_argument("--gap-mb", type=float, default=1.0,
                     help="相邻区间间隔小于它就并成一次请求")
+    ap.add_argument("--meta-only", action="store_true",
+                    help="只取 config.json 与 tokenizer（约 10MB），**不碰任何张量**。"
+                         "控制机要用 —— 它不跑模型，但要读 config 算模型规格、"
+                         "读 tokenizer 编解码文本。给它 141GB 权重是浪费")
     ap.add_argument("--no-tokenizer", action="store_true",
                     help="不取 tokenizer（节点其实用不到，默认取是为了目录自洽）")
     ap.add_argument("--dry-run", action="store_true", help="只算要下多少，不下")
@@ -423,9 +429,42 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(message)s")
     src = Source(repo=args.repo, revision=args.revision, base_url=args.base_url,
                  local=args.src, endpoint=args.endpoint)
-    man = DeploymentManifest.from_json(args.plan.read_text(encoding="utf-8"))
+    if not args.meta_only and not (args.plan and args.node):
+        ap.error("要么给 --plan 与 --node（拉本机那份权重），"
+                 "要么给 --meta-only（只拉 config 与 tokenizer）")
+    man = (DeploymentManifest.from_json(args.plan.read_text(encoding="utf-8"))
+           if args.plan else None)
 
-    cfg = src.read_json("config.json")
+    try:
+        cfg = src.read_json("config.json")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log.error("读不到 %s 的 config.json：%s", src, e)
+        log.error("  · 私有仓库要 HF_TOKEN；国内网络试 HF_ENDPOINT=https://hf-mirror.com")
+        log.error("  · 已经有全量 checkpoint 的话用 --src <目录> 从本地取")
+        return 2
+
+    if args.meta_only:
+        # 控制机这条路：不看清单、不算 key、一个张量都不下。
+        args.out.mkdir(parents=True, exist_ok=True)
+        got, miss = [], []
+        for f in TOKENIZER_FILES:
+            try:
+                (args.out / f).write_bytes(src.read(f))
+                got.append(f)
+            except Exception:
+                miss.append(f)      # generation_config 之类不是每个仓库都有
+        n = sum((args.out / f).stat().st_size for f in got)
+        log.info("元数据 → %s（%d 个文件，%.1f MB）", args.out, len(got), n / 1e6)
+        log.info("  %s", ", ".join(got))
+        if miss:
+            log.info("  仓库里没有：%s（多数情况无所谓）", ", ".join(miss))
+        if "config.json" not in got:
+            log.error("config.json 没取到 —— 控制机没它算不了模型规格")
+            return 2
+        log.info("控制机的 --model-dir 指到这里即可。**这里没有权重**，"
+                 "节点上的同名目录才有。")
+        return 0
+
     keys = keys_for_node(man, args.node, config=cfg)
     p = man.plan_for(args.node)
     arch = str(cfg.get("model_type", "?"))
