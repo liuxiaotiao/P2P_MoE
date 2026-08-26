@@ -288,10 +288,12 @@ cmd_fetch() {
   echo "  合计约 141GB（全模型 160GB × 15 台 = 2400GB，省 94%）"
   echo "  先看会下多少："
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" "${SSHARG[@]}" --dry-run
+      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
+      "${SSHARG[@]}" --dry-run
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
+      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
+      "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }
 
 cmd_start() {

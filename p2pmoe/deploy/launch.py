@@ -112,6 +112,20 @@ def _start_cmd(h: Host, workdir: str, python: str, logdir: str) -> str:
     )
 
 
+def _warn_default_workdir(args) -> None:
+    """`--workdir` 默认是 `"."`，而远端的 `cd .` 落在 **ssh 登录目录**（通常是
+    $HOME），不是代码目录。症状是每台都报 `No module named 'p2pmoe'` ——
+    看起来像没装，其实是跑在了错的目录里。
+
+    本机模式（`--local`）没这个问题：`.` 就是当前进程的工作目录。
+    """
+    if args.local or args.workdir not in (".", "./"):
+        return
+    print("  ⚠ 没给 --workdir，远端会 `cd .` —— 那是 ssh 登录目录（通常 $HOME），")
+    print("    不是代码目录。如果各节点的代码不在那儿，会报 No module named 'p2pmoe'。")
+    print("    加上 --workdir /path/to/p2p-framework（deploy_15.sh 用 $WORKDIR）")
+
+
 def _stop_cmd(h: Host) -> str:
     # 精确匹配 --id，避免误杀同机上别的 agent
     return f"pkill -f {shlex.quote(f'p2pmoe.deploy.agent --id {h.node_id} ')} || true"
@@ -239,6 +253,7 @@ def _fetch_all(hosts, args) -> int:
         print("fetch 需要 --repo（或自建源的 --endpoint）")
         return 2
     out = args.out or "/data/p2pmoe-weights"
+    _warn_default_workdir(args)
 
     def cmd_for(h) -> str:
         parts = [args.python, "-m", "p2pmoe.deploy.fetch",
@@ -252,8 +267,12 @@ def _fetch_all(hosts, args) -> int:
         return " ".join(parts)
 
     if args.dry_run:
+        # 打**真正会执行的那条**，含 `cd`。少打 cd 的代价：workdir 配错时
+        # dry-run 看起来完全正常，直到真跑才报 No module named 'p2pmoe'。
         for h in hosts:
-            print(f"  {h.node_id:<8} {cmd_for(h)}")
+            shown = (cmd_for(h) if args.local
+                     else f"cd {shlex.quote(args.workdir)} && {cmd_for(h)}")
+            print(f"  {h.node_id:<8} {shown}")
         return 0
 
     def run_one(h):
@@ -366,6 +385,9 @@ def main(argv: list[str] | None = None) -> int:
                    if args.action == "start" else _stop_cmd(h))
             print(f"# {h.node_id} @ {h.host}\n{cmd}\n")
         return 0
+
+    if args.action == "start":
+        _warn_default_workdir(args)
 
     def run_one(h: Host):
         try:
