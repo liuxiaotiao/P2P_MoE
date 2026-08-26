@@ -389,8 +389,15 @@ N15  192.168.1.25:9101</pre>
     <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
 <pre><span class="k">export</span> ADVERTISE=<span class="s">192.168.1.100</span>        <span class="c"># 控制机对节点可见的 IP —— 必填</span>
 <span class="k">export</span> SSH_USER=<span class="s">ubuntu</span>                <span class="c"># ssh 用户名，root 就不用设</span>
-<span class="k">export</span> SSH_OPTS=<span class="s">"-i ~/.ssh/pool.pem"</span>  <span class="c"># 私钥/端口，没有就不设</span></pre>
+<span class="k">export</span> SSH_OPTS=<span class="s">"-i ~/.ssh/pool.pem"</span>  <span class="c"># 私钥/端口，没有就不设</span>
+
+<span class="k">export</span> WORKDIR=<span class="s">/home/ubuntu/P2P_MoE</span>
+<span class="k">export</span> NODE_PY=<span class="s">/home/ubuntu/miniconda3/envs/moe/bin/python</span></pre>
   </div>
+
+  <h3><code>NODE_PY</code> 为什么要写绝对路径</h3>
+  <p>torch 装在 conda 环境里的话，<b>裸 <code>python3</code> 是看不见它的</b>。而 <code>ssh host '...'</code> 起的是非交互 shell，<b>不会执行 conda init</b> —— <code>conda activate moe</code> 在那里不存在，<code>python3</code> 指的是系统那个。所以要直接指到环境里的解释器。</p>
+  <p>不知道路径就跑 <code>./deploy_15.sh doctor</code>，它会在各节点上找出来并打印该填什么。<code>NODE_PY</code> 和控制机的 <code>PY</code> 是两回事 —— 控制机不装 torch。</p>
 
   <div class="note warn">
     <p><code>ADVERTISE</code> 是必填的：节点建链时要<b>回连</b>控制机，得知道往哪连。写 <code>127.0.0.1</code> 会让 15 台各自连自己。</p>
@@ -451,13 +458,13 @@ N15  192.168.1.25:9101</pre>
     <h3>每台节点 · 粘属于它的那一段</h3>
     <div class="term">
       <div class="term-head"><span class="term-where node">节点 N07</span><button class="copy">复制</button></div>
-<pre>mkdir -p /opt/p2pmoe &amp;&amp; <span class="k">cd</span> /opt/p2pmoe \
+<pre>mkdir -p /home/ubuntu/P2P_MoE &amp;&amp; <span class="k">cd</span> /home/ubuntu/P2P_MoE \
   &amp;&amp; curl -fsSL http://192.168.1.100:9300/p2pmoe.tar.gz | tar xz \
   &amp;&amp; curl -fsSL http://192.168.1.100:9300/plan.json -o /tmp/plan.json \
-  &amp;&amp; python3 -m pip install -q -r requirements-node.txt \
-  &amp;&amp; python3 -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node <span class="s">N07</span> \
+  &amp;&amp; $NODE_PY -m pip install -q -r requirements-node.txt \
+  &amp;&amp; $NODE_PY -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node <span class="s">N07</span> \
        --repo Qwen/Qwen3-Next-80B-A3B-Instruct --out /data/qwen3-next-part \
-  &amp;&amp; setsid nohup python3 -m p2pmoe.deploy.agent --id <span class="s">N07</span> --bind 0.0.0.0:9101 \
+  &amp;&amp; setsid nohup $NODE_PY -m p2pmoe.deploy.agent --id <span class="s">N07</span> --bind 0.0.0.0:9101 \
        &gt; /tmp/agent-N07.log 2&gt;&amp;1 &amp;</pre>
     </div>
     <p>一条命令四件事：拉代码 → 装依赖 → <b>只拉本机那份权重</b> → 起 agent。15 台<b>互不依赖，可以同时跑</b>。</p>
@@ -626,7 +633,8 @@ req1   gsm8k gsm8k ✓  F1×Bgsm8k0         33     0    14    3.1   34%
         <tr><td class="mono">✗ 必须设 ADVERTISE</td><td>见 <a href="#s2">§02</a></td></tr>
         <tr><td class="mono">规划失败: 公共中值域人口 0</td><td>节点之间延迟差异太小（比如全在一台机器上模拟），公共中值域退化。真机上不会遇到；本地演练加 <code>--mem-cap-mb</code></td></tr>
         <tr><td class="mono">没有 L₀ 同时满足 p ≥ 0.8…</td><td>内存上限太紧，前段单节点装不下。真机上 24 GB 卡装 L₀=11 的前段（14.5 GB）是够的</td></tr>
-        <tr><td>某台 agent 没起来</td><td><code>tail /tmp/agent-N07.log</code>。最常见是 <code>--out</code> 目录没权限，或 torch 装的是 CPU 版而 <code>--device cuda:0</code></td></tr>
+        <tr><td><b>agent 起来就死</b><br><span style="color:var(--ink-3)">start 报 ✓ 但 check 全不可达</span></td><td>PID 只说明 fork 成功了。跑 <code>./deploy_15.sh doctor</code> 逐台体检。三种典型：<b>日志不存在</b> → <code>cd $WORKDIR</code> 就失败了，代码不在那儿；<b><code>No module named 'p2pmoe'</code></b> → 目录在但代码没进去；<b><code>No module named 'torch'</code></b> → <code>NODE_PY</code> 指错了解释器</td></tr>
+        <tr><td class="mono">sync 报「同一个目录」</td><td>控制机自己就是这台、且就坐在 <code>$WORKDIR</code> 里。跳过 rsync 是对的（对着自己跑 <code>--delete</code> 会咬人），依赖照装</td></tr>
         <tr><td class="mono">节点上报的错误</td><td>通常是权重缺张量。让那台重跑一次 <code>fetch</code>（会跳过已有的，只补缺的）</td></tr>
         <tr><td>请求超时</td><td><code>report</code> 里看 <code>missing_traces</code>：哪台没上报埋点。没上报的节点，它的计算时间会被算进「网络」那一栏</td></tr>
       </tbody>
@@ -663,6 +671,8 @@ req1   gsm8k gsm8k ✓  F1×Bgsm8k0         33     0    14    3.1   34%
         <tr><td class="mono">serve</td><td>建链 + 打请求</td></tr>
         <tr><td class="mono">measure</td><td>同上 + 预热 + 逐请求时序</td></tr>
         <tr><td class="mono">report [文件]</td><td>把结果 JSON 读成表</td></tr>
+        <tr><td class="mono">logs [节点]</td><td>拉 agent 日志</td></tr>
+        <tr><td class="mono">doctor [节点]</td><td>逐台体检：代码 / torch / 权重 / 端口 / 日志</td></tr>
         <tr><td class="mono">stop</td><td>停 15 个 agent</td></tr>
       </tbody>
     </table>
@@ -674,7 +684,8 @@ req1   gsm8k gsm8k ✓  F1×Bgsm8k0         33     0    14    3.1   34%
     <div class="term-head"><span class="term-where">控制机</span><button class="copy">复制</button></div>
 <pre>HOSTS=task/hosts.txt            PLAN=task/plan_deploy.json
 PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
-WEIGHTS=/data/qwen3-next-part   WORKDIR=/opt/p2pmoe
+WEIGHTS=/data/qwen3-next-part   WORKDIR=/home/ubuntu/P2P_MoE
+NODE_PY=<span class="s">&lt;节点上带 torch 的解释器&gt;</span>  CONDA_ENV=moe
 ADVERTISE=<span class="s">&lt;必填&gt;</span>                DEVICE=cuda:0
 COVERAGE=0.70                   TASKS=mbpp=5,gsm8k=3
 TOKENS=64   REQUESTS=20   WARMUP=2

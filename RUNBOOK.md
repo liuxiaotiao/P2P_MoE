@@ -77,7 +77,20 @@ N15  192.168.1.25:9101
 export ADVERTISE=192.168.1.100        # 控制机对节点可见的 IP —— 必填
 export SSH_USER=ubuntu                # ssh 用户名，root 就不用设
 export SSH_OPTS="-i ~/.ssh/pool.pem"  # 私钥/端口，没有就不设
+
+export WORKDIR=/home/ubuntu/P2P_MoE   # 各节点上代码放哪儿
+export NODE_PY=/home/ubuntu/miniconda3/envs/moe/bin/python   # 节点上带 torch 的解释器
 ```
+
+### `NODE_PY` 为什么要写绝对路径
+
+torch 装在 conda 环境里的话，**裸 `python3` 是看不见它的**。而 `ssh host '...'` 起的是
+非交互 shell，不会执行 conda init —— `conda activate moe` 在那里不存在，`python3`
+指的是系统的那个。所以要直接指到环境里的解释器。
+
+不知道路径就跑 `./deploy_15.sh doctor`，它会在各节点上找出来并打印该填什么。
+
+**`NODE_PY` 和控制机的 `PY` 是两回事** —— 控制机不装 torch（见 §01）。
 
 `ADVERTISE` 是必填的：节点建链时要回连控制机，得知道往哪连。写 `127.0.0.1` 会让 15 台各自连自己。
 
@@ -144,13 +157,13 @@ ADVERTISE=192.168.1.100 ./deploy_15.sh bootstrap
 │  层 2–10（9 层），要拉 11.9 GB，占显存约 12.0 GB
 └─
 
-  mkdir -p /opt/p2pmoe && cd /opt/p2pmoe \
+  mkdir -p /home/ubuntu/P2P_MoE && cd /home/ubuntu/P2P_MoE \
     && curl -fsSL http://192.168.1.100:9300/p2pmoe.tar.gz | tar xz \
     && curl -fsSL http://192.168.1.100:9300/plan.json -o /tmp/plan.json \
-    && python3 -m pip install -q -r requirements-node.txt \
-    && python3 -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node N07 \
+    && $NODE_PY -m pip install -q -r requirements-node.txt \
+    && $NODE_PY -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node N07 \
          --repo Qwen/Qwen3-Next-80B-A3B-Instruct --out /data/qwen3-next-part \
-    && setsid nohup python3 -m p2pmoe.deploy.agent --id N07 --bind 0.0.0.0:9101 \
+    && setsid nohup $NODE_PY -m p2pmoe.deploy.agent --id N07 --bind 0.0.0.0:9101 \
          > /tmp/agent-N07.log 2>&1 &
 ```
 
@@ -315,11 +328,20 @@ done
 
 **`✗ 必须设 ADVERTISE`** —— 见 §2。
 
+**`sync` 报「同一个目录」** —— 控制机自己就是这台，而且就坐在 `$WORKDIR` 里。跳过 rsync 是对的（对着自己跑 `--delete` 会咬人），依赖照装。
+
 **`规划失败: 公共中值域人口 0`** —— 节点之间延迟差异太小（比如全在一台机器上模拟），公共中值域退化。真机上不会遇到；本地演练加 `--mem-cap-mb`。
 
 **`没有 L₀ 同时满足 p ≥ 0.8…`** —— 内存上限太紧，前段单节点装不下。真机上 24 GB 卡装 L₀=11 的前段（14.5 GB）是够的。
 
-**某台 agent 没起来** —— `tail /tmp/agent-N07.log`。最常见是 `--out` 目录没权限，或 torch 装的是 CPU 版而 `--device cuda:0`。
+**agent 起来就死（`start` 报 ✓ 但 `check` 全部不可达）** —— PID 只说明 fork 成功了。
+跑 `./deploy_15.sh doctor` 逐台体检。三种典型：
+
+- **日志不存在** → `cd $WORKDIR` 就失败了，代码不在那儿。`./deploy_15.sh sync`
+- **`No module named 'p2pmoe'`** → 目录在但代码没进去。同上
+- **`No module named 'torch'`** → `NODE_PY` 指错了解释器。`doctor` 会找出正确的路径
+
+`doctor` 里 ssh 失败与远端某项缺失是**分开报**的 —— 它们看起来一样，修法相反。
 
 **`节点上报的错误`** —— 通常是权重缺张量。让那台重跑一次 `fetch`（它会跳过已有的，只补缺的）。
 
@@ -355,6 +377,8 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 | `./deploy_15.sh serve` | 控制机 | 建链 + 打请求 |
 | `./deploy_15.sh measure` | 控制机 | 同上 + 预热 + 逐请求时序 |
 | `./deploy_15.sh report [文件]` | 控制机 | 把结果 JSON 读成表 |
+| `./deploy_15.sh logs [节点]` | 控制机 | 拉 agent 日志 |
+| `./deploy_15.sh doctor [节点]` | 控制机 | 逐台体检：代码/torch/权重/端口/日志 |
 | `./deploy_15.sh stop` | 控制机 | 停 15 个 agent |
 
 配置项（环境变量覆盖，或改脚本顶部）：
@@ -362,7 +386,8 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 ```
 HOSTS=task/hosts.txt          PLAN=task/plan_deploy.json
 PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
-WEIGHTS=/data/qwen3-next-part   WORKDIR=/opt/p2pmoe
+WEIGHTS=/data/qwen3-next-part   WORKDIR=/home/ubuntu/P2P_MoE
+NODE_PY=<节点上带 torch 的解释器>  CONDA_ENV=moe
 ADVERTISE=<必填>               DEVICE=cuda:0
 COVERAGE=0.70                  TASKS=mbpp=5,gsm8k=3
 TOKENS=64  REQUESTS=20  WARMUP=2

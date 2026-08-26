@@ -36,7 +36,14 @@ PLAN=${PLAN:-task/plan_deploy.json}            # 离线算好的部署清单
 PROFILE=${PROFILE:-task/profile_real.json}     # 激活画像（动态模式的分类器要它）
 REPO=${REPO:-Qwen/Qwen3-Next-80B-A3B-Instruct}
 WEIGHTS=${WEIGHTS:-/data/qwen3-next-part}      # 各节点上的本地路径（**各机相同**）
-WORKDIR=${WORKDIR:-/opt/p2pmoe}                # 各节点上的代码目录
+WORKDIR=${WORKDIR:-/home/ubuntu/P2P_MoE}       # 各节点上的代码目录
+# 节点上跑 torch 的那个解释器。**和控制机的 PY 是两回事** —— 控制机不装 torch。
+# torch 在 conda 环境里的话，这里要填**绝对路径**，不能只写 python3：
+#     NODE_PY=/home/ubuntu/miniconda3/envs/moe/bin/python
+# ssh 非交互 shell 不会执行 conda init，`conda activate` 和裸 `python3` 都找不到它。
+# 不知道路径就跑 ./deploy_15.sh doctor —— 它会在各节点上找出来并告诉你填什么。
+NODE_PY=${NODE_PY:-python3}
+CONDA_ENV=${CONDA_ENV:-moe}                    # doctor 找 conda 环境时按这个名字找
 ADVERTISE=${ADVERTISE:-}                       # 控制机对节点可见的 IP —— 必填
 DEVICE=${DEVICE:-cuda:0}
 COVERAGE=${COVERAGE:-0.70}
@@ -84,10 +91,10 @@ cmd_bootstrap() {
   mkdir -p $WORKDIR && cd $WORKDIR \\
     && curl -fsSL http://$ip:$port/p2pmoe.tar.gz | tar xz \\
     && curl -fsSL http://$ip:$port/plan.json -o /tmp/plan.json \\
-    && $PY -m pip install -q -r requirements-node.txt \\
-    && $PY -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node \$ID \\
+    && $NODE_PY -m pip install -q -r requirements-node.txt \\
+    && $NODE_PY -m p2pmoe.deploy.fetch --plan /tmp/plan.json --node \$ID \\
          --repo $REPO --out $WEIGHTS \\
-    && setsid nohup $PY -m p2pmoe.deploy.agent --id \$ID --bind 0.0.0.0:9101 \\
+    && setsid nohup $NODE_PY -m p2pmoe.deploy.agent --id \$ID --bind 0.0.0.0:9101 \\
          > /tmp/agent-\$ID.log 2>&1 &
 
 EOS
@@ -171,18 +178,42 @@ cmd_sync() {
   command -v rsync >/dev/null || { echo "✗ 控制机没有 rsync"; exit 1; }
   local hosts
   hosts=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]}' "$HOSTS")
+  # 控制机自己可能就是这 15 台之一，而且就坐在 $WORKDIR 里 ——
+  # 那样 `rsync -az --delete ./ host:$WORKDIR/` 是对着自己跑，--delete 会咬人。
+  # 放一个一次性标记，从远端看得见就说明是同一个目录，跳过 rsync。
+  local stamp=".p2pmoe-syncid-$$"
+  : > "$stamp"
+  trap 'rm -f "$stamp"' RETURN
+
   for h in $hosts; do
-    echo "  → $h"
+    printf '  → %-16s' "$h"
     ssh -o BatchMode=yes ${SSH_OPTS:-} "${SSH_USER:+$SSH_USER@}$h" \
         "mkdir -p '$WORKDIR' '$WEIGHTS'" </dev/null
-    rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
-      --exclude '__pycache__' --exclude '.git' --exclude 'task' \
-      --exclude '*.pyc' --exclude '.pytest_cache' --exclude '.*-logs' \
-      ./ "${SSH_USER:+$SSH_USER@}$h:$WORKDIR/"
+    if ssh -o BatchMode=yes ${SSH_OPTS:-} "${SSH_USER:+$SSH_USER@}$h" \
+           "[ -e '$WORKDIR/$stamp' ]" </dev/null 2>/dev/null; then
+      echo "同一个目录（控制机就在这台的 $WORKDIR）—— 跳过 rsync"
+    else
+      rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
+        --exclude '__pycache__' --exclude '.git' --exclude 'task' \
+        --exclude '*.pyc' --exclude '.pytest_cache' --exclude '.*-logs' \
+        --exclude '.p2pmoe-syncid-*' --exclude 'results' \
+        ./ "${SSH_USER:+$SSH_USER@}$h:$WORKDIR/"
+      printf '代码 ✓  '
+    fi
     ssh -o BatchMode=yes ${SSH_OPTS:-} "${SSH_USER:+$SSH_USER@}$h" \
-        "cd '$WORKDIR' && $PY -m pip install -q -r requirements-node.txt" </dev/null
+        "cd '$WORKDIR' && '$NODE_PY' -m pip install -q -r requirements-node.txt" </dev/null \
+      && echo "依赖 ✓" || echo "依赖 ✗（$NODE_PY 装不上，跑 ./deploy_15.sh doctor 看看）"
   done
-  echo "  ✓ 15 台都有代码与 torch/safetensors"
+  # task/ 整个被排除（里面有几百 MB 的 CSV），但清单必须过去 ——
+  # 节点上的 `fetch --plan task/plan_deploy.json` 要读它。
+  echo "  推清单 $PLAN"
+  for h in $hosts; do
+    ssh -o BatchMode=yes ${SSH_OPTS:-} "${SSH_USER:+$SSH_USER@}$h" \
+        "mkdir -p '$WORKDIR/$(dirname "$PLAN")'" </dev/null
+    rsync -az ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
+      "$PLAN" "${SSH_USER:+$SSH_USER@}$h:$WORKDIR/$PLAN" 2>/dev/null || true
+  done
+  echo "  ✓ 15 台都有代码、清单与 torch/safetensors（用 $NODE_PY 装的）"
   echo "  （没 ssh：手工 rsync 到各机 $WORKDIR，再各自 pip install -r requirements-node.txt）"
 }
 
@@ -229,15 +260,16 @@ cmd_fetch() {
   echo "  合计约 141GB（全模型 160GB × 15 台 = 2400GB，省 94%）"
   echo "  先看会下多少："
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" "${SSHARG[@]}" --dry-run
+      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" "${SSHARG[@]}" --dry-run
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
+      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }
 
 cmd_start() {
   say "4. 起 agent"
-  $PY -m p2pmoe.deploy.launch start --hosts "$HOSTS" --workdir "$WORKDIR" "${SSHARG[@]}"
+  $PY -m p2pmoe.deploy.launch start --hosts "$HOSTS" --workdir "$WORKDIR" \
+      --python "$NODE_PY" "${SSHARG[@]}"
   sleep 5
   $PY -m p2pmoe.deploy.launch status --hosts "$HOSTS" "${SSHARG[@]}"
 }
@@ -330,14 +362,31 @@ PYEOF
 _probe_script() {
   local id=$1
   cat <<EOS
-W=$WORKDIR; L=/tmp/p2pmoe/agent-$id.log; D=$WEIGHTS
-printf 'workdir  %-10s ' "\$W"; [ -d "\$W" ] && echo ok || echo '✗ 目录不存在'
-printf 'package  %-10s ' 'p2pmoe/'; [ -f "\$W/p2pmoe/deploy/agent.py" ] && echo ok || echo '✗ 代码不在这儿'
-printf 'python   %-10s ' ''; $PY -V 2>&1 | head -1
-printf 'torch    %-10s ' ''; $PY -c 'import torch;print(torch.__version__, "cuda" if torch.cuda.is_available() else "CPU-only")' 2>/dev/null || echo '✗ 没装'
-printf 'weights  %-10s ' "\$D"; [ -d "\$D" ] && echo "ok (\$(du -sh "\$D" 2>/dev/null | cut -f1))" || echo '✗ 没拉过'
-printf 'port     %-10s ' '9101'; (ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -q ':9101 ' && echo '在听' || echo '空闲'
-printf 'log      %-10s ' "\$L"; if [ -f "\$L" ]; then echo "\$(wc -l < "\$L") 行"; else echo '✗ 不存在（进程连启动都没到）'; fi
+W=$WORKDIR; L=/tmp/p2pmoe/agent-$id.log; D=$WEIGHTS; NP='$NODE_PY'; CE='$CONDA_ENV'
+printf 'workdir  %-12s ' "\$W"; [ -d "\$W" ] && echo ok || echo '✗ 目录不存在'
+printf 'package  %-12s ' 'p2pmoe/'; [ -f "\$W/p2pmoe/deploy/agent.py" ] && echo ok || echo '✗ 代码不在这儿'
+printf 'NODE_PY  %-12s ' ''; if command -v "\$NP" >/dev/null 2>&1 || [ -x "\$NP" ]; then
+  echo "\$NP -> \$("\$NP" -V 2>&1 | head -1)"
+else echo "✗ \$NP 不存在"; fi
+printf 'torch    %-12s ' ''
+"\$NP" -c 'import torch;print(torch.__version__, torch.cuda.is_available() and ("cuda "+torch.cuda.get_device_name(0)) or "CPU-only")' 2>/dev/null \
+  || echo "✗ \$NP 里没有 torch"
+# torch 不在当前解释器里的话，去 conda 环境里找一遍 —— 找到就直接给出该填的值
+if ! "\$NP" -c 'import torch' >/dev/null 2>&1; then
+  for B in "\$HOME/miniconda3" "\$HOME/anaconda3" "\$HOME/miniforge3" "\$HOME/mambaforge" /opt/conda "\$(conda info --base 2>/dev/null)"; do
+    [ -n "\$B" ] || continue
+    for E in "\$CE" base; do
+      C="\$B/envs/\$E/bin/python"; [ "\$E" = base ] && C="\$B/bin/python"
+      if [ -x "\$C" ] && "\$C" -c 'import torch' >/dev/null 2>&1; then
+        echo "  ↳ 找到了：NODE_PY=\$C   (torch \$("\$C" -c 'import torch;print(torch.__version__)' 2>/dev/null))"
+        break 2
+      fi
+    done
+  done
+fi
+printf 'weights  %-12s ' "\$D"; [ -d "\$D" ] && echo "ok (\$(du -sh "\$D" 2>/dev/null | cut -f1))" || echo '✗ 没拉过'
+printf 'port     %-12s ' '9101'; (ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -q ':9101 ' && echo '在听' || echo '空闲'
+printf 'log      %-12s ' ''; if [ -s "\$L" ]; then echo "\$L (\$(wc -l < "\$L") 行)"; else echo "\$L ✗ 不存在（进程连启动都没到）"; fi
 [ -s "\$L" ] && { echo '--- 日志末尾 ---'; tail -n 8 "\$L"; }
 exit 0
 EOS
@@ -369,14 +418,32 @@ cmd_doctor() {
     fi
     sed 's/^/   /' "$d/$id.out"
     grep -q '代码不在这儿' "$d/$id.out" && nocode=$((nocode+1))
-    grep -q "torch.*✗" "$d/$id.out" && notorch=$((notorch+1))
+    grep -q '没有 torch' "$d/$id.out" && notorch=$((notorch+1))
+    grep -h '↳ 找到了：NODE_PY=' "$d/$id.out" >> "$d/_found" 2>/dev/null || true
   done
 
   echo
   say "结论"
   [ "$nossh"   -gt 0 ] && echo "  · $nossh 台 ssh 连不上 —— 检查 SSH_USER/SSH_OPTS，或走 ./deploy_15.sh bootstrap"
   [ "$nocode"  -gt 0 ] && echo "  · $nocode 台没有代码 —— ./deploy_15.sh sync"
-  [ "$notorch" -gt 0 ] && echo "  · $notorch 台没装 torch —— sync 会顺带装（它跑 pip install -r requirements-node.txt）"
+  if [ "$notorch" -gt 0 ]; then
+    echo "  · $notorch 台的 NODE_PY（$NODE_PY）里没有 torch"
+    if [ -s "$d/_found" ]; then
+      local uniq; uniq=$(sed 's/.*NODE_PY=//;s/ .*//' "$d/_found" | sort -u)
+      local n_u; n_u=$(echo "$uniq" | wc -l)
+      if [ "$n_u" = 1 ]; then
+        echo "    在各节点上找到了带 torch 的解释器，照这个设："
+        echo
+        echo "        export NODE_PY=$uniq"
+        echo
+      else
+        echo "    各节点路径不一致，逐台确认："
+        echo "$uniq" | sed 's/^/        /'
+      fi
+    else
+      echo "    也没找到别的带 torch 的环境 —— ./deploy_15.sh sync 会装（用 $NODE_PY）"
+    fi
+  fi
   [ "$nossh$nocode$notorch" = "000" ] && echo "  · 每台该有的都有了。agent 还是起不来的话，看上面各自的日志末尾。"
   return 0
 }
