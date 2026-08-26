@@ -445,7 +445,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.meta_only:
         # 控制机这条路：不看清单、不算 key、一个张量都不下。
-        args.out.mkdir(parents=True, exist_ok=True)
+        try:
+            args.out.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError) as e:
+            # /data 之类的系统目录要 root，而这套东西不该需要 root。
+            # 裸 traceback 会让人去查 pathlib，而真正要改的是一个路径。
+            log.error("建不了 %s：%s", args.out, e)
+            log.error("  换一个写得进去的地方，比如项目目录下：")
+            log.error("      export WEIGHTS=$PWD/weights")
+            log.error("      ./deploy_15.sh meta")
+            log.error("  注意 15 台节点上这个路径要**一致** —— 清单按同一个 "
+                      "--model-dir 下发。")
+            return 2
         got, miss = [], []
         for f in TOKENIZER_FILES:
             try:
@@ -472,6 +483,13 @@ def main(argv: list[str] | None = None) -> int:
              args.node, p.role, p.layer_range[0], p.layer_range[1],
              sum(len(l.experts) for l in p.layers), arch, len(keys))
     log.info("来源 %s", src)
+
+    try:
+        args.out.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        log.error("建不了 %s：%s", args.out, e)
+        log.error("  换一个写得进去的地方（15 台要一致），比如 $WORKDIR/weights")
+        return 2
 
     t0 = time.perf_counter()
     try:

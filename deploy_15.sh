@@ -36,8 +36,14 @@ HOSTS=${HOSTS:-task/hosts.txt}                 # 节点 id → IP:端口
 PLAN=${PLAN:-task/plan_deploy.json}            # 离线算好的部署清单
 PROFILE=${PROFILE:-task/profile_real.json}     # 激活画像（动态模式的分类器要它）
 REPO=${REPO:-Qwen/Qwen3-Next-80B-A3B-Instruct}
-WEIGHTS=${WEIGHTS:-/data/qwen3-next-part}      # 各节点上的本地路径（**各机相同**）
 WORKDIR=${WORKDIR:-/home/ubuntu/P2P_MoE}       # 各节点上的代码目录
+# 权重放哪儿（**各机相同的路径**）。默认在项目目录下 —— /data 之类的系统目录
+# 通常要 root，而这套东西不该需要 root。
+#
+# 放在 $WORKDIR 里有个陷阱：`sync` 用 `rsync --delete`，源端没有的东西会被删掉，
+# 而权重是各节点自己拉的、源端根本没有 —— 一次 sync 就能抹掉 141GB。
+# 所以下面 sync 会**自动把它排除**（bootstrap 打包时同理）。
+WEIGHTS=${WEIGHTS:-$WORKDIR/weights}
 # 节点上跑 torch 的那个解释器。**和控制机的 PY 是两回事** —— 控制机不装 torch。
 # torch 在 conda 环境里的话，这里要填**绝对路径**，不能只写 python3：
 #     NODE_PY=/home/ubuntu/miniconda3/envs/moe/bin/python
@@ -57,6 +63,14 @@ WARMUP=${WARMUP:-2}                             # measure 前丢掉几条（冷�
 # ---------------------------------------------------------------------------
 
 PY=${PY:-python3}
+
+# 权重目录在代码目录里面的话，同步与打包都必须绕开它。
+# 这不是优化 —— rsync --delete 会真的把 141GB 删掉，tar 会真的把它打进包里。
+WEIGHTS_REL=""
+case "$WEIGHTS" in
+  "$WORKDIR"/*) WEIGHTS_REL=${WEIGHTS#"$WORKDIR"/} ;;
+esac
+
 # ssh 相关：SSH_USER=ubuntu 或 SSH_OPTS="-i ~/.ssh/pool.pem -p 2222"
 SSHARG=()
 [ -n "${SSH_USER:-}" ] && SSHARG+=(--user "$SSH_USER")
@@ -80,7 +94,8 @@ cmd_bootstrap() {
   say "B. 引导（无 ssh）"
   tar czf "$tmp/p2pmoe.tar.gz" \
       --exclude '__pycache__' --exclude '.git' --exclude '*.pyc' \
-      --exclude '.pytest_cache' --exclude '.*-logs' --exclude 'task/*.csv' .
+      --exclude '.pytest_cache' --exclude '.*-logs' --exclude 'task/*.csv' \
+      --exclude 'results' ${WEIGHTS_REL:+--exclude "$WEIGHTS_REL"} .
   cp "$PLAN" "$tmp/plan.json"
   echo "  代码包 $(du -h "$tmp/p2pmoe.tar.gz" | cut -f1)，清单 $(du -h "$tmp/plan.json" | cut -f1)"
   echo
@@ -176,6 +191,10 @@ PYEOF
 # 代码与依赖不会自己长到节点上 —— 先把它们送过去。
 cmd_sync() {
   say "S. 推代码 + 装依赖到 15 台"
+  if [ -n "$WEIGHTS_REL" ]; then
+    echo "  权重在 $WEIGHTS（代码目录里面）—— rsync 会排除 $WEIGHTS_REL/"
+    echo "  否则 --delete 会把各节点自己拉的权重当成「源端没有」删掉"
+  fi
   command -v rsync >/dev/null || { echo "✗ 控制机没有 rsync"; exit 1; }
   local hosts
   hosts=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]}' "$HOSTS")
@@ -198,6 +217,7 @@ cmd_sync() {
         --exclude '__pycache__' --exclude '.git' --exclude 'task' \
         --exclude '*.pyc' --exclude '.pytest_cache' --exclude '.*-logs' \
         --exclude '.p2pmoe-syncid-*' --exclude 'results' \
+        ${WEIGHTS_REL:+--exclude "$WEIGHTS_REL"} \
         ./ "${SSH_USER:+$SSH_USER@}$h:$WORKDIR/"
       printf '代码 ✓  '
     fi
@@ -498,6 +518,13 @@ cmd_logs() {
 # 不经过控制机。所以这里只要约 10MB，不是 141GB。
 cmd_meta() {
   say "M. 控制机取模型元数据（约 10MB，不含权重）"
+  if ! mkdir -p "$WEIGHTS" 2>/dev/null; then
+    echo "  ✗ 建不了 $WEIGHTS —— 没权限。"
+    echo "    把 WEIGHTS 设到你写得进去的地方，比如项目目录下："
+    echo "        export WEIGHTS=$WORKDIR/weights"
+    exit 1
+  fi
+  echo "  → $WEIGHTS"
   $PY -m p2pmoe.deploy.fetch --meta-only --repo "$REPO" --out "$WEIGHTS" \
       ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }

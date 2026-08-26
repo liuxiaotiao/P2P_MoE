@@ -86,9 +86,26 @@ export ADVERTISE=192.168.1.100        # 控制机对节点可见的 IP —— �
 export SSH_USER=ubuntu                # ssh 用户名，root 就不用设
 export SSH_OPTS="-i ~/.ssh/pool.pem"  # 私钥/端口，没有就不设
 
-export WORKDIR=/home/ubuntu/P2P_MoE   # 各节点上代码放哪儿
-export NODE_PY=/home/ubuntu/miniconda3/envs/moe/bin/python   # 节点上带 torch 的解释器
+export WORKDIR=/home/ubuntu/P2P_MoE            # 各节点上代码放哪儿
+export WEIGHTS=$WORKDIR/weights                # 权重放哪儿（15 台路径要一致）
+export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python   # 节点上带 torch 的解释器
 ```
+
+### 权重别放 `/data`
+
+`/data`、`/opt` 这类系统目录通常要 root，而这套东西不该需要 root。默认放在
+`$WORKDIR/weights`。
+
+放在代码目录里有个**会静默删掉 141GB 的陷阱**：`sync` 用 `rsync --delete`，
+目的端有、源端没有的东西会被删 —— 而权重恰恰是各节点自己拉的、源端根本没有。
+所以 `sync` 会自动把它排除（`bootstrap` 打包时同理），并在跑之前告诉你：
+
+```
+  权重在 /home/ubuntu/P2P_MoE/weights（代码目录里面）—— rsync 会排除 weights/
+```
+
+`test_weights_survive_sync.py` 盯着这个排除项，顺带盯着「别为了保权重把
+`--delete` 也废掉」—— 旧代码留在节点上会跑出错误结果。
 
 ### `NODE_PY` 为什么要写绝对路径
 
@@ -341,7 +358,9 @@ done
 
 ## 8. 常见问题
 
-**`/data/xxx/config.json 不存在`** —— 控制机也要这个目录，但只要里面的
+**`PermissionError: /data`** —— 系统目录要 root。`export WEIGHTS=$WORKDIR/weights`。
+
+**`xxx/config.json 不存在`** —— 控制机也要这个目录，但只要里面的
 `config.json` 与 tokenizer（约 10MB），**不要权重**。跑 `./deploy_15.sh meta`。
 
 **某个 task 分到 0 条后段** —— 规划器按内存与跳数约束分**整数条**通道，配额不够时
@@ -410,7 +429,7 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 ```
 HOSTS=task/hosts.txt          PLAN=task/plan_deploy.json
 PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
-WEIGHTS=/data/qwen3-next-part   WORKDIR=/home/ubuntu/P2P_MoE
+WEIGHTS=$WORKDIR/weights        WORKDIR=/home/ubuntu/P2P_MoE
 NODE_PY=<节点上带 torch 的解释器>  CONDA_ENV=moe
 ADVERTISE=<必填>               DEVICE=cuda:0
 COVERAGE=0.70                  TASKS=mbpp=5,gsm8k=3
