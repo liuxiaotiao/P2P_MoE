@@ -307,6 +307,89 @@ req1   gsm8k gsm8k ✓  F1×Bgsm8k0         33     0    14    3.1   34%
 
 ---
 
+## 5b. 上游拉不动怎么办
+
+两种失败，含义完全不同：
+
+| 症状 | 含义 |
+|---|---|
+| `SSL: UNEXPECTED_EOF_WHILE_READING`<br>`Connection reset` | 链路在传输中途被掐断 —— 几 KB 的文件过得去，11MB 的 `tokenizer.json` 过不去 |
+| `RangeNotSupported` | 源不支持 Range 请求 —— 「只拉自己那份张量」这件事做不成 |
+
+### 掐断
+
+`Source.read` **会按已收字节续传** —— 断在 8MB 就从 8MB 接着要，不是从头重来。
+每次只肯传几百字节的链路也能爬完（实测 137 字节一段，256KB 用 1869 次请求拼齐，
+逐字节一致）。
+
+续传之后还是失败，说明每次都断在很早。**这通常不是 HF 的问题**，先复现一次：
+
+```bash
+curl -v -o /dev/null https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/resolve/main/config.json
+```
+
+三个常见原因：
+
+- **TLS 检查型代理 / 防火墙**掐长连接。查 `$https_proxy` / `$HTTPS_PROXY`，
+  或者让 IT 放行 `huggingface.co` 与 `cdn-lfs.huggingface.co`。
+- **MTU 黑洞**（小包过、大包丢，VPN / 隧道上常见）。试
+  `sudo ip link set dev <网卡> mtu 1400` 再跑。
+- **出口 CDN 抖动**。换个时间，或 `--endpoint` 指到别的镜像。
+
+私有/受限仓库另说 —— 那要 `HF_TOKEN`（`hf auth login` 之后在
+`~/.cache/huggingface/token`）。
+
+### 绕过去：下一次全量，局域网分发
+
+在**一台**能稳定联网的机器上拉一份完整 checkpoint：
+
+```bash
+hf download Qwen/Qwen3-Next-80B-A3B-Instruct --local-dir ./ckpt
+```
+
+`hf download`（`pip install -U huggingface_hub`）比 git 稳：**能断点续传**，
+断了重跑接着下，不用从头来。在会掐断的链路上这是决定性的差别。
+
+用 git 的话记住 `GIT_LFS_SKIP_SMUDGE=1` **只做了一半**：
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct
+cd Qwen3-Next-80B-A3B-Instruct
+git lfs pull          # ← 这一步才是真正下权重
+```
+
+只跑第一条的话，41 个 `.safetensors` 都在、名字对、数量对，但**每个只有 130 字节
+的指针文本**。`serve-weights` 和 `fetch` 都会认出来并点名（否则错会以
+`头长 1936026161 不合理` 的形式出现在解析文件头那一步，离真正的原因隔了三层）。
+
+起一个**支持 Range 的**权重源：
+
+```bash
+bash ./deploy_15.sh serve-weights ./ckpt
+```
+
+另开终端：
+
+```bash
+SRC_URL=http://<那台的IP>:9400 bash ./deploy_15.sh fetch
+```
+
+合计仍然只拉 141GB，只是源站换成了自己人，走局域网。
+
+**不能用 `python -m http.server`** —— 实测它无视 Range 头，返回 200 加整个文件。
+那样每台会拿到整个分片（`fetch` 认得出来并报 `RangeNotSupported`，不会将就 ——
+按区间长度去切一个整文件会得到一份内容错位的权重）。
+
+有 NFS / 共享盘就连服务都不用起：
+
+```bash
+SRC_DIR=/mnt/shared/ckpt bash ./deploy_15.sh fetch
+```
+
+各节点直接 seek 本地文件，连 HTTP 都省了。
+
+---
+
 ## 6. 横向对比
 
 ```bash
@@ -416,6 +499,7 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 | `./deploy_15.sh check` | 控制机 | ssh 可达 + agent 在线 + 两两可达 |
 | `./deploy_15.sh fetch` | 控制机 | 各节点只拉自己那份权重 |
 | `./deploy_15.sh meta` | 控制机 | 取 config + tokenizer（10MB，不含权重） |
+| `./deploy_15.sh serve-weights <目录>` | 有全量的那台 | 起一个支持 Range 的局域网权重源 |
 | `./deploy_15.sh start` | 控制机 | 起 15 个 agent |
 | `./deploy_15.sh serve` | 控制机 | 建链 + 打请求 |
 | `./deploy_15.sh measure` | 控制机 | 同上 + 预热 + 逐请求时序 |
@@ -430,6 +514,7 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 HOSTS=task/hosts.txt          PLAN=task/plan_deploy.json
 PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
 WEIGHTS=$WORKDIR/weights        WORKDIR=/home/ubuntu/P2P_MoE
+SRC_DIR=  SRC_URL=  MODE=slice  FETCH_TIMEOUT=14400  WSRC_PORT=9400
 NODE_PY=<节点上带 torch 的解释器>  CONDA_ENV=moe
 ADVERTISE=<必填>               DEVICE=cuda:0
 COVERAGE=0.70                  TASKS=mbpp=5,gsm8k=3

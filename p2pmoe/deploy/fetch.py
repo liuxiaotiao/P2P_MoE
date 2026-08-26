@@ -75,9 +75,11 @@ class Source:
     def __init__(self, *, repo: str | None = None, revision: str = "main",
                  base_url: str | None = None, local: str | Path | None = None,
                  token: str | None = None, endpoint: str | None = None,
-                 timeout: float = 60.0):
+                 timeout: float = 60.0, retries: int = 5):
         self.local = Path(local) if local else None
         self.timeout = timeout
+        self.retries = max(1, retries)
+        self._len: dict[str, int] = {}
         self.token = token or os.environ.get("HF_TOKEN")
         if self.local is None:
             if base_url:
@@ -96,7 +98,18 @@ class Source:
 
     # -- 取字节 ------------------------------------------------------------ #
     def read(self, name: str, start: int | None = None, end: int | None = None) -> bytes:
-        """读 name 的 [start, end) 字节；不给区间就整读。"""
+        """读 name 的 [start, end) 字节；不给区间就整读。
+
+        **断了会从断点续。** 一次性 `urlopen().read()` 的问题是：连接在中途被
+        掐断时，已经收到的几 MB 全部作废，重来一次大概率断在同一个地方。
+
+        「小文件过得去、大文件过不去」是个很常见的形状 —— TLS 检查型代理掐长
+        连接、MTU 黑洞丢大包、CDN 重置，都会这样。它们的共同点是**总能传一段**，
+        所以按已收字节数续传就能爬完，不必弄清到底是哪一种。
+
+        续传本身要求上游支持 Range。不支持的话第一次就会被 `RangeNotSupported`
+        挡下来，走不到这里。
+        """
         if self.local is not None:
             with open(self.local / name, "rb") as fh:
                 if start is None:
@@ -104,22 +117,80 @@ class Source:
                 fh.seek(start)
                 return fh.read(end - start)
 
+        buf = bytearray()
+        want = None if start is None else end - start
+        stalls = 0          # **连续**没进展的次数。有进展就清零。
+        while True:
+            lo = (start or 0) + len(buf)
+            before = len(buf)
+            try:
+                chunk, status = self._get(name, lo, end,
+                                          ranged=start is not None or bool(buf))
+                buf += chunk
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                stalls += 1
+                if stalls >= self.retries:
+                    raise
+                log.debug("%s 断于 %d 字节（%s），%.1fs 后续传…",
+                          name, len(buf), type(e).__name__, 0.5 * stalls)
+                time.sleep(0.5 * stalls)
+                continue
+
+            if want is not None:
+                if len(buf) >= want:
+                    return bytes(buf[:want])
+            else:
+                # 整读：拿 Content-Length / Content-Range 判完没完。
+                # **不能因为「返回了 200」就认为读完了** —— 200 说的是请求成功，
+                # 不是响应体完整；连接在中途断掉时状态码早就发出去了。
+                total = self._len.get(name) or 0
+                if total:
+                    if len(buf) >= total:
+                        return bytes(buf[:total])
+                elif chunk:
+                    # 两个长度头都没有，只能信「一次读完」——
+                    # 否则会一直向后要，拿回空响应，转到重试上限为止。
+                    return bytes(buf)
+
+            # 重试计数只数**没进展**的轮次：链路每次只肯传几百 KB 时，
+            # 那不是失败，是慢 —— 数成失败的话大文件永远爬不完。
+            if len(buf) == before:
+                stalls += 1
+                if stalls >= self.retries:
+                    if want is None:
+                        return bytes(buf)
+                    raise OSError(
+                        f"{name}: 只拿到 {len(buf)}/{want} 字节，"
+                        f"连续 {stalls} 次没有进展")
+                time.sleep(0.5 * stalls)
+            else:
+                stalls = 0
+
+    def _get(self, name: str, lo: int, hi: int | None, *, ranged: bool):
         req = urllib.request.Request(f"{self.base}/{name}")
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
-        if start is not None:
-            req.add_header("Range", f"bytes={start}-{end - 1}")
+        if ranged:
+            req.add_header("Range",
+                           f"bytes={lo}-{hi - 1}" if hi is not None else f"bytes={lo}-")
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            if start is not None and r.status != 206:
+            if ranged and hi is not None and lo == 0 and r.status != 206:
                 # 200 表示对端无视了 Range 把整个文件发了过来。**必须报错而不是
                 # 将就**：那意味着「省下载」这件事根本没发生，而拼出来的文件还
                 # 会是错的（我们按区间长度去切）。
                 raise RangeNotSupported(
                     f"{self.base} 不支持 Range 请求（请求 {name} 的一小段，"
                     f"对端返回 {r.status} 把整个文件发了回来）—— "
-                    f"改用 --mode shard，或换一个支持 Range 的镜像"
+                    f"改用 --mode shard，或换一个支持 Range 的源"
                 )
-            return r.read()
+            self._len[name] = self._len.get(name) or (
+                int(r.headers.get("Content-Range", "").rpartition("/")[2] or 0)
+                or (int(r.headers.get("Content-Length") or 0) if r.status == 200 else 0))
+            return r.read(), r.status
+
+    def _done(self, name: str, got: int) -> bool:
+        total = self._len.get(name) or 0
+        return bool(total) and got >= total
 
     def read_json(self, name: str) -> dict:
         return json.loads(self.read(name).decode("utf-8"))
@@ -186,13 +257,42 @@ class FetchPlan:
 
 
 # --------------------------------------------------------------------------- #
+_LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
+
+
+def looks_like_lfs_pointer(head: bytes) -> bool:
+    """这几个字节是 LFS 指针文本，不是 safetensors。
+
+    `GIT_LFS_SKIP_SMUDGE=1 git clone` 只把仓库结构拉下来，每个大文件留一个
+    130 字节左右的指针::
+
+        version https://git-lfs.github.com/spec/v1
+        oid sha256:9f86d0…
+        size 4294967296
+
+    目录看起来是对的 —— 41 个 `.safetensors` 都在，只是每个都是文本。
+    不认出来的话，报错会变成「头长 1936026161 不合理」之类，指向完全错误的方向。
+    """
+    return head[:len(_LFS_MAGIC)] == _LFS_MAGIC
+
+
 def read_header(src: Source, shard: str) -> tuple[dict, int]:
     """读 safetensors 的文件头。返回 (头 JSON, 数据段起始偏移)。
 
     布局是 `[8 字节小端 u64 = 头长 N][N 字节 JSON][数据]`，头里每个张量的
     `data_offsets` 是**相对数据段**的，所以绝对偏移要加 8 + N。
     """
-    n = int.from_bytes(src.read(shard, 0, 8), "little")
+    head = src.read(shard, 0, 64)
+    if looks_like_lfs_pointer(head):
+        raise ValueError(
+            f"{shard} 是 **git-lfs 指针**，不是权重。\n"
+            f"  `GIT_LFS_SKIP_SMUDGE=1 git clone` 只拉仓库结构，大文件留一个"
+            f"130 字节的指针 —— 目录看着是对的，41 个分片都在，但每个都是文本。\n"
+            f"  补上真正的权重：\n"
+            f"      cd <克隆出来的目录> && git lfs pull\n"
+            f"  或者换个工具（能断点续传，比 git 稳）：\n"
+            f"      hf download Qwen/Qwen3-Next-80B-A3B-Instruct --local-dir ./ckpt")
+    n = int.from_bytes(head[:8], "little")
     if not 0 < n <= _HDR_MAX:
         raise ValueError(f"{shard} 的头长 {n} 不合理 —— 这是 safetensors 文件吗？")
     return json.loads(src.read(shard, 8, 8 + n).decode("utf-8")), 8 + n
@@ -439,7 +539,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg = src.read_json("config.json")
     except (urllib.error.URLError, OSError, ValueError) as e:
         log.error("读不到 %s 的 config.json：%s", src, e)
-        log.error("  · 私有仓库要 HF_TOKEN；国内网络试 HF_ENDPOINT=https://hf-mirror.com")
+        log.error("  · 私有/受限仓库要 HF_TOKEN（`hf auth login` 之后在 "
+                  "~/.cache/huggingface/token）")
+        log.error("  · 连接被中途掐断：查代理（$https_proxy）、MTU、"
+                  "或换 --endpoint")
         log.error("  · 已经有全量 checkpoint 的话用 --src <目录> 从本地取")
         return 2
 
@@ -509,24 +612,28 @@ def main(argv: list[str] | None = None) -> int:
                       ("UNEXPECTED_EOF", "ConnectionReset", "Connection reset",
                        "EOF occurred", "timed out", "TimeoutError"))
             ep = os.environ.get("HF_ENDPOINT")
-            if cut and not ep:
+            if cut:
                 log.error("  这个错的形状是**链路在传输中途被掐断**："
                           "几 KB 的文件都过了，只有 11MB 的 tokenizer.json 没过。")
-                log.error("  重试同一个地址没用，换出口：")
-                log.error("")
-                log.error("      HF_ENDPOINT=https://hf-mirror.com \\")
-                log.error("          bash ./deploy_15.sh meta")
-                log.error("")
-                log.error("  （环境变量要写在命令**前面**；"
-                          "`bash HF_ENDPOINT=... ./x.sh` 是把它当成脚本名了）")
-            elif cut and ep:
-                log.error("  %s 也掐 —— 换个镜像，或者手动取这一个文件：", ep)
+                log.error("  代码已经会按已收字节续传，还是不行的话，"
+                          "先用 curl 复现一次、看是不是同一处断：")
+                log.error("      curl -v -o /dev/null %s/tokenizer.json",
+                          src.base)
+                log.error("  常见的三个原因（都不是 HF 的问题）：")
+                log.error("    · TLS 检查型代理/防火墙掐长连接 —— 查 "
+                          "$https_proxy / $HTTPS_PROXY，或让 IT 放行 huggingface.co")
+                log.error("    · MTU 黑洞（小包过、大包丢，VPN/隧道上常见）—— "
+                          "试 `ip link set dev <网卡> mtu 1400` 再跑")
+                log.error("    · 出口 CDN 抖动 —— 换个时间，或换 --endpoint 到"
+                          "别的镜像")
+                if ep:
+                    log.error("  当前 --endpoint 是 %s；试试去掉它直连。", ep)
             else:
                 log.error("  重跑一次试试。")
-            log.error("  实在不行就手动弄到位 —— 就一个文件，怎么下都行：")
+            log.error("  绕过去也行 —— 就一个文件，用什么下都可以：")
             log.error("      curl -L -o %s/tokenizer.json \\", args.out)
             log.error("          %s/tokenizer.json", src.base)
-            log.error("      # 或用已有的本地全量：--src <目录>")
+            log.error("      # 或者已有全量 checkpoint：--src <目录>")
 
         need = {"config.json": "控制机没它算不了模型规格",
                 "tokenizer.json": "控制机没它没法把 prompt 编成 id、把 id 解回文本"}

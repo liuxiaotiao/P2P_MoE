@@ -8,6 +8,7 @@
 #   ./deploy_15.sh check      # 只检查连通性与依赖，不动任何东西
 #   ./deploy_15.sh fetch      # 各节点只拉自己那份权重（合计 141GB，不是 2400GB）
 #   ./deploy_15.sh meta       # 控制机取 config+tokenizer（10MB，不含权重）
+#   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
@@ -57,6 +58,14 @@ COVERAGE=${COVERAGE:-0.70}
 TASKS=${TASKS:-mbpp=5,gsm8k=3}
 TOKENS=${TOKENS:-64}
 REQUESTS=${REQUESTS:-20}
+# 权重从哪儿来。三选一，优先级从上到下：
+#   SRC_DIR   各节点都能读到的全量 checkpoint（NFS/共享盘）—— 走本地文件读，不用网
+#   SRC_URL   局域网里的权重源 —— 一台跑 serve-weights，其余从它切片
+#   （都不设） 直连 HF（HF_ENDPOINT 可换镜像）
+# 上游拉不动时用前两个：先在一台机器上下一次全量，再局域网分发。
+# 注意上游拉不动**通常不是 HF 的问题** —— 见 3a 预检失败时打印的三个常见原因。
+SRC_DIR=${SRC_DIR:-}
+SRC_URL=${SRC_URL:-}
 MODE=${MODE:-slice}                             # slice=逐张量；shard=整分片（源站不支持 Range 时）
 FETCH_TIMEOUT=${FETCH_TIMEOUT:-14400}           # 单节点下载超时（秒）
 PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
@@ -287,12 +296,24 @@ PYEOF
 
 cmd_fetch() {
   say "3. 各节点只拉自己那份权重"
-  local ep=${HF_ENDPOINT:-https://huggingface.co}
+  # 来源三选一
+  SRCARG=()
+  local ep
+  if [ -n "$SRC_DIR" ]; then
+    SRCARG=(--src "$SRC_DIR"); ep="本地目录 $SRC_DIR（各节点自己读，不走网）"
+  elif [ -n "$SRC_URL" ]; then
+    SRCARG=(--base-url "$SRC_URL"); ep="局域网权重源 $SRC_URL"
+  else
+    SRCARG=(--repo "$REPO" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"})
+    ep=${HF_ENDPOINT:-https://huggingface.co}
+  fi
   echo "  合计约 141GB（全模型 160GB × 15 台 = 2400GB，省 94%）"
-  echo "  源站 $ep"
+  echo "  源  $ep"
   echo "    ↑ **各节点**从这里拉，不是控制机。控制机的网络好不好在这里不算数。"
-  [ -z "${HF_ENDPOINT:-}" ] && \
-    echo "    国内网络多半要换：export HF_ENDPOINT=https://hf-mirror.com"
+  if [ -z "$SRC_DIR$SRC_URL" ] && [ -z "${HF_ENDPOINT:-}" ]; then
+    echo "    拉不动时：先看 3a 的预检怎么说；实在不行就下一次全量再局域网分发"
+    echo "    （./deploy_15.sh serve-weights <全量目录>）"
+  fi
 
   # 先用**一台**试通。141GB 下到一半才发现源站不通、或者不支持 Range，
   # 代价是几小时；这里花几十秒就能问清楚。
@@ -300,9 +321,10 @@ cmd_fetch() {
   local firstip; firstip=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]; exit}' "$HOSTS")
   say "3a. 先用 $first 试通源站（读文件头，不下张量）"
   local probe out rc
+  local srcstr=""
+  for x in "${SRCARG[@]}"; do srcstr="$srcstr $(printf %q "$x")"; done
   probe="cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") -m p2pmoe.deploy.fetch \
---plan $(printf %q "$PLAN") --node $first --out $(printf %q "$WEIGHTS") \
---repo $(printf %q "$REPO") ${HF_ENDPOINT:+--endpoint $(printf %q "$HF_ENDPOINT")} --dry-run"
+--plan $(printf %q "$PLAN") --node $first --out $(printf %q "$WEIGHTS")$srcstr --dry-run"
   out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
           "${SSH_USER:+$SSH_USER@}$firstip" "$probe" </dev/null 2>&1) && rc=0 || rc=$?
   echo "$out" | sed 's/^/    /'
@@ -311,9 +333,16 @@ cmd_fetch() {
     echo "  ✗ $first 连源站就失败了 —— 15 台一起下只会失败 15 次。"
     case "$out" in
       *UNEXPECTED_EOF*|*"Connection reset"*|*"timed out"*)
-        echo "    这个错的形状是链路被掐断。换源："
-        echo "        export HF_ENDPOINT=https://hf-mirror.com"
-        echo "        bash ./deploy_15.sh fetch" ;;
+        echo "    链路在传输中途被掐断（代码已会续传，仍失败说明每次都断在很早）。"
+        echo "    先在那台机器上用 curl 复现，看是不是同一处断："
+        echo "        curl -v -o /dev/null https://huggingface.co/$REPO/resolve/main/config.json"
+        echo "    常见三个原因，都不是 HF 的问题："
+        echo "      · TLS 检查型代理/防火墙掐长连接 —— 查 \$https_proxy，或让 IT 放行"
+        echo "      · MTU 黑洞（小包过、大包丢，VPN/隧道上常见）—— 试把 MTU 降到 1400"
+        echo "      · 出口 CDN 抖动 —— 换时间，或 --endpoint 换个镜像"
+        echo "    绕过去：一台机器下全量，其余从局域网切片"
+        echo "        bash ./deploy_15.sh serve-weights <全量目录>"
+        echo "        SRC_URL=http://<那台的IP>:9400 bash ./deploy_15.sh fetch" ;;
       *RangeNotSupported*|*"不支持 Range"*)
         echo "    源站不支持 Range 请求 —— 「只拉需要的张量」这件事做不成。"
         echo "    换一个支持 Range 的镜像，或者退到整分片模式（省得少但能跑）：" 
@@ -330,9 +359,9 @@ cmd_fetch() {
   echo "  超时上限 ${FETCH_TIMEOUT:-14400}s（--timeout），不够就调大。"
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
-      --repo "$REPO" --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
-      --mode "${MODE:-slice}" --timeout "${FETCH_TIMEOUT:-14400}" \
-      "${SSHARG[@]}" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
+      --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
+      --mode "$MODE" --timeout "$FETCH_TIMEOUT" \
+      "${SSHARG[@]}" "${SRCARG[@]}"
 }
 
 cmd_start() {
@@ -570,6 +599,27 @@ cmd_meta() {
       ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }
 
+# 上游拉不动时：先在**一台**机器上下一份全量，再让 15 台从局域网切片。
+#
+#     git clone https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct   # 160GB，一次
+#     bash ./deploy_15.sh serve-weights /path/to/Qwen3-Next-80B-A3B-Instruct
+#     # 另开终端：
+#     SRC_URL=http://<这台的IP>:9400 bash ./deploy_15.sh fetch
+#
+# 合计仍然只拉 141GB，只是源站换成了自己人。
+#
+# 为什么不能用 `python -m http.server`：它**不支持 Range** —— 无视 Range 头，
+# 返回 200 加整个文件。而「只拉自己那份张量」完全靠 Range，用它的话每台会
+# 拿到整个分片（fetch 认得出来并报错，不会将就）。所以这里自己起一个。
+#
+# 有 NFS/共享盘的话连服务都不用起：SRC_DIR=/mnt/shared/ckpt bash ./deploy_15.sh fetch
+cmd_serve_weights() {
+  local d=${1:-$SRC_DIR}
+  [ -n "$d" ] || { echo "用法: $0 serve-weights <全量checkpoint目录>"; exit 1; }
+  say "W. 局域网权重源"
+  $PY -m p2pmoe.deploy.serve_weights --dir "$d" --bind "0.0.0.0:${WSRC_PORT:-9400}"
+}
+
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
 
 # serve / measure 后面多写的参数**原样透传给 control.py**，例如
@@ -585,6 +635,7 @@ case "$action" in
   check)   cmd_check ;;
   fetch)   cmd_fetch ;;
   meta)    cmd_meta ;;
+  serve-weights) cmd_serve_weights "${1:-}" ;;
   start)   cmd_start ;;
   serve)   cmd_serve "$@" ;;
   measure) cmd_measure "$@" ;;
@@ -593,6 +644,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|serve-weights|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac
