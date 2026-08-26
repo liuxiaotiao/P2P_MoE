@@ -23,8 +23,11 @@ hosts 文件每行一台，`#` 注释：
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import subprocess
+import threading
+import time
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -137,6 +140,72 @@ def _start_cmd(h: Host, workdir: str, python: str, logdir: str) -> str:
         f"setsid nohup {' '.join(shlex.quote(a) for a in args)} "
         f">> {shlex.quote(logdir)}/agent-{h.node_id}.log 2>&1 < /dev/null & echo $!"
     )
+
+
+def _expected_bytes(plan_path, per_node_dir: bool) -> dict[str, int]:
+    """清单里每台该拉多少字节。进度条的分母。"""
+    try:
+        m = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {n["node"]: int(float(n.get("weight_gb", 0)) * 1e9) for n in m.get("nodes", [])}
+
+
+def _du(h: Host, path: str, *, ssh: str, user: str | None) -> int:
+    """远端目录当前多大。`du -sb` 很便宜，30 秒问一次不心疼。"""
+    ok, out = _ssh(h, f"du -sb {shlex.quote(path)} 2>/dev/null | cut -f1",
+                   ssh=ssh, user=user, timeout=20)
+    if not ok:
+        return -1
+    tok = out.strip().split()
+    return int(tok[0]) if tok and tok[0].isdigit() else -1
+
+
+def _progress_loop(hosts, out_of: dict[str, int], out_dir, *, ssh, user,
+                   every: float, stop: "threading.Event", per_node_dir: bool,
+                   local: bool) -> None:
+    """每 `every` 秒打一次进度表。
+
+    为什么要有：`fetch` 是**几小时**的操作，而每个节点的输出被 `capture_output`
+    扣着，要等它整个跑完才吐出来。中间什么都没有的话，人分不清「在下」「卡住了」
+    和「早就死了」—— 而这三件事的处置完全不同。
+
+    问的是目录大小，不是进程状态：进程活着但一个字节没动，才是最需要看见的那种卡。
+    """
+    t0 = time.monotonic()
+    last: dict[str, int] = {}
+    while not stop.wait(every):
+        rows = []
+        for h in hosts:
+            d = f"{out_dir}/{h.node_id}" if per_node_dir else out_dir
+            got = -1 if local else _du(h, d, ssh=ssh, user=user)
+            want = out_of.get(h.node_id, 0)
+            # 第一次采样没有「上一次」可比 —— delta 记 None，而不是 0。
+            # 记 0 的话首屏会把每台都标成「无增长」，而那正是最刺眼的告警。
+            delta = None if h.node_id not in last else got - last[h.node_id]
+            rows.append((h.node_id, got, want, delta))
+            if got >= 0:
+                last[h.node_id] = got
+        done = sum(1 for _, g, w, _ in rows if w and g >= w * 0.98)
+        tot_got = sum(max(0, g) for _, g, _, _ in rows)
+        tot_want = sum(w for _, _, w, _ in rows) or 1
+        el = time.monotonic() - t0
+        rate = tot_got / el if el > 0 else 0
+        eta = (tot_want - tot_got) / rate if rate > 1e3 else 0
+        print(f"\n  ── 进度 +{el/60:.0f}min  "
+              f"{tot_got/1e9:.1f}/{tot_want/1e9:.0f}GB  "
+              f"({tot_got/tot_want:.0%})  {rate/1e6:.0f}MB/s  "
+              f"{done}/{len(rows)} 台完成"
+              + (f"  剩约 {eta/60:.0f}min" if eta else ""))
+        for nid, got, want, delta in sorted(rows):
+            if got < 0:
+                print(f"     {nid:<6} ?（问不到目录大小）")
+                continue
+            frac = got / want if want else 0
+            bar = "█" * round(24 * min(1.0, frac)) + "·" * (24 - round(24 * min(1.0, frac)))
+            # 两次之间没长 = 卡住了。进程还在不代表在下东西。
+            mark = ("  ⏸ 无增长" if delta == 0 and got < want * 0.98 else "")
+            print(f"     {nid:<6} {bar} {got/1e9:>5.1f}/{want/1e9:<5.1f}GB{mark}")
 
 
 def _warn_default_workdir(args) -> None:
@@ -324,8 +393,28 @@ def _fetch_all(hosts, args) -> int:
             return h, False, f"{type(e).__name__}: {e}"[:200]
 
     # 各节点并行拉 —— 这正是不经控制机中转的意义
-    with ThreadPoolExecutor(max_workers=args.parallel) as ex:
-        rows = list(ex.map(run_one, hosts))
+    stop = threading.Event()
+    mon: threading.Thread | None = None
+    if args.progress_every > 0 and not args.local:
+        exp = _expected_bytes(args.plan, args.per_node_dir)
+        if exp:
+            print(f"  每 {args.progress_every:.0f}s 报一次进度"
+                  f"（问的是目录大小，不是进程状态）")
+            mon = threading.Thread(
+                target=_progress_loop, args=(hosts, exp, out),
+                kwargs=dict(ssh=args.ssh, user=args.user,
+                            every=args.progress_every, stop=stop,
+                            per_node_dir=args.per_node_dir, local=args.local),
+                daemon=True)
+            mon.start()
+    try:
+        with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            rows = list(ex.map(run_one, hosts))
+    finally:
+        stop.set()
+        if mon:
+            mon.join(timeout=3)
+        print()
     n_ok = 0
     for h, ok, msg in rows:
         print(f"  {h.node_id:<8} {'✓' if ok else '✗'} {_brief(msg)}")
@@ -357,6 +446,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--local", action="store_true",
                     help="不走 ssh，在本机执行（用于同机演练与自测）")
     ap.add_argument("--parallel", type=int, default=16)
+    ap.add_argument("--progress-every", type=float, default=30.0, metavar="秒",
+                    help="fetch 期间多久报一次进度（0=关）。问的是各节点输出目录"
+                         "的大小 —— 几小时的操作没有中间输出的话，"
+                         "分不清「在下」「卡住了」和「早就死了」")
     ap.add_argument("--timeout", type=float, default=4 * 3600, metavar="秒",
                     help="fetch 的单节点超时。默认 4 小时 —— 单台最多拉 22GB，"
                          "控制命令那套 60 秒的口径在这里必然超时")

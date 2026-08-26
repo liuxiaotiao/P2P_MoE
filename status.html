@@ -1,0 +1,422 @@
+<title>P2P MoE 进度盘点</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#F4F6F8; --surface:#FFFFFF; --sunken:#EAEEF2;
+  --ink:#161C22; --ink-2:#3E4A55; --ink-3:#6B7883;
+  --rule:#D7DEE5; --rule-soft:#E6EBF0;
+  --accent:#0B6E7F; --accent-soft:#E0F0F3;
+  --done:#2A6F53; --done-soft:#DFEDE7;
+  --now:#9A5B14; --now-soft:#F7EAD8;
+  --todo:#8892A0; --todo-soft:#E8ECF0;
+  --crit:#A3282B; --crit-soft:#F8E5E5;
+  --term-bg:#12181E; --term-ink:#D3DBE3; --term-dim:#6E7C89;
+  --term-key:#5FBFD0; --term-str:#C9A66B;
+  --shadow:0 1px 2px rgba(22,28,34,.06), 0 8px 24px -12px rgba(22,28,34,.18);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F1418; --surface:#171E24; --sunken:#1E272E;
+    --ink:#E6ECF1; --ink-2:#AFBCC7; --ink-3:#7C8994;
+    --rule:#2C3841; --rule-soft:#232D35;
+    --accent:#4FC3D6; --accent-soft:#12323A;
+    --done:#5FBF92; --done-soft:#123028;
+    --now:#D9A25A; --now-soft:#332512;
+    --todo:#7C8994; --todo-soft:#232D35;
+    --crit:#E48285; --crit-soft:#3A1E1F;
+    --term-bg:#0A0E12; --term-ink:#D3DBE3;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F1418; --surface:#171E24; --sunken:#1E272E;
+  --ink:#E6ECF1; --ink-2:#AFBCC7; --ink-3:#7C8994;
+  --rule:#2C3841; --rule-soft:#232D35;
+  --accent:#4FC3D6; --accent-soft:#12323A;
+  --done:#5FBF92; --done-soft:#123028;
+  --now:#D9A25A; --now-soft:#332512;
+  --todo:#7C8994; --todo-soft:#232D35;
+  --crit:#E48285; --crit-soft:#3A1E1F;
+  --term-bg:#0A0E12; --term-ink:#D3DBE3;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font:400 16px/1.65 "IBM Plex Sans","Noto Sans SC",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+h1,h2,h3{font-family:Archivo,"IBM Plex Sans","Noto Sans SC",system-ui,sans-serif;
+  text-wrap:balance;margin:0}
+code,pre,.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+
+.wrap{max-width:1060px;margin:0 auto;padding:0 24px 96px}
+.mast{border-bottom:1px solid var(--rule);margin-bottom:36px;padding:48px 0 28px}
+.eyebrow{font:600 11px/1 "IBM Plex Mono",monospace;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--accent);margin-bottom:14px}
+.mast h1{font-size:clamp(28px,4.2vw,42px);font-weight:700;letter-spacing:-.02em;line-height:1.12}
+.mast .sub{color:var(--ink-2);font-size:17px;margin-top:12px;max-width:62ch}
+
+section{scroll-margin-top:24px;margin-bottom:52px}
+section>h2{font-size:22px;font-weight:600;letter-spacing:-.012em;
+  padding-bottom:10px;border-bottom:2px solid var(--ink);margin-bottom:20px;
+  display:flex;align-items:baseline;gap:11px}
+section>h2 .n{font:600 11px/1 "IBM Plex Mono",monospace;color:var(--accent);
+  letter-spacing:.1em;flex:none}
+h3{font-size:15px;font-weight:600;margin:26px 0 10px}
+p{margin:0 0 13px;max-width:70ch} p:last-child{margin-bottom:0}
+ul{margin:0 0 13px;padding-left:20px;max-width:68ch} li{margin-bottom:5px}
+.lede{font-size:17px;color:var(--ink-2);max-width:66ch}
+code:not(pre code){background:var(--sunken);padding:.1em .38em;border-radius:3px;
+  font-size:.875em;border:1px solid var(--rule-soft)}
+
+/* ---- 流水线 ---- */
+.pipe{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));
+  gap:1px;background:var(--rule-soft);border:1px solid var(--rule-soft);
+  border-radius:8px;overflow:hidden;margin:0 0 8px}
+.step{background:var(--surface);padding:13px 12px 14px;position:relative}
+.step .k{font:600 10px/1 "IBM Plex Mono",monospace;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);display:block;margin-bottom:8px}
+.step .t{font:600 14px/1.25 Archivo,sans-serif;display:block}
+.step .d{font-size:11.5px;color:var(--ink-3);margin-top:5px;line-height:1.45}
+.step.done{background:var(--done-soft)} .step.done .t{color:var(--done)}
+.step.done .k{color:var(--done)}
+.step.now{background:var(--now-soft);box-shadow:inset 0 -3px 0 var(--now)}
+.step.now .t{color:var(--now)} .step.now .k{color:var(--now)}
+.pipe-legend{display:flex;gap:18px;flex-wrap:wrap;font-size:11.5px;color:var(--ink-3);
+  margin-bottom:26px}
+.pipe-legend span{display:flex;align-items:center;gap:6px}
+.sw{width:11px;height:11px;border-radius:2.5px;flex:none}
+
+/* ---- 数字 ---- */
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));
+  gap:1px;background:var(--rule-soft);border:1px solid var(--rule-soft);
+  border-radius:8px;overflow:hidden;margin:0 0 18px}
+.fact{background:var(--surface);padding:14px 16px}
+.fact dt{font:600 10px/1 "IBM Plex Mono",monospace;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3)}
+.fact dd{margin:8px 0 0;font:600 21px/1.1 Archivo,sans-serif;font-variant-numeric:tabular-nums}
+.fact dd small{font-size:11.5px;font-weight:500;color:var(--ink-3);display:block;
+  margin-top:5px;font-family:"IBM Plex Sans",sans-serif;letter-spacing:0}
+
+/* ---- 条形 ---- */
+.bars{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:18px 20px 14px;margin:0 0 18px}
+.bar{display:grid;grid-template-columns:150px minmax(0,1fr) 50px;gap:12px;
+  align-items:center;margin-bottom:9px;font-size:13.5px}
+.bar-lab{color:var(--ink-2)}
+.bar-track{height:20px;background:var(--sunken);border-radius:4px;overflow:hidden;
+  border:1px solid var(--rule-soft)}
+.bar-fill{height:100%;background:var(--accent);border-radius:3px 0 0 3px}
+.bar-n{text-align:right;font-variant-numeric:tabular-nums;
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--ink-2)}
+
+/* ---- 表 ---- */
+.scroll{overflow-x:auto;margin:0 0 18px;border:1px solid var(--rule);
+  border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--rule-soft);
+  vertical-align:top}
+thead th{font:600 10px/1.3 "IBM Plex Mono",monospace;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);background:var(--sunken);white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td.mono,th.mono{font-family:"IBM Plex Mono",monospace;font-size:12.5px}
+td.num{text-align:right;font-variant-numeric:tabular-nums;
+  font-family:"IBM Plex Mono",monospace}
+
+.chip{display:inline-block;padding:2.5px 8px;border-radius:20px;
+  font:600 10.5px/1.35 "IBM Plex Mono",monospace;letter-spacing:.04em;white-space:nowrap}
+.chip.done{background:var(--done-soft);color:var(--done)}
+.chip.now{background:var(--now-soft);color:var(--now)}
+.chip.todo{background:var(--todo-soft);color:var(--todo)}
+.chip.crit{background:var(--crit-soft);color:var(--crit)}
+
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);
+  padding:13px 16px;border-radius:0 6px 6px 0;margin:0 0 18px;font-size:14.5px}
+.note.warn{border-left-color:var(--crit);background:var(--crit-soft)}
+.note.ok{border-left-color:var(--done);background:var(--done-soft)}
+.note p{max-width:66ch}
+
+.term{background:var(--term-bg);border-radius:8px;margin:0 0 18px;overflow:hidden;
+  box-shadow:var(--shadow)}
+.term pre{margin:0;padding:14px;overflow-x:auto;font-size:12.5px;line-height:1.7;
+  color:var(--term-ink)}
+.term .c{color:var(--term-dim)} .term .k{color:var(--term-key)} .term .s{color:var(--term-str)}
+
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;
+  margin-bottom:18px}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:16px 18px}
+.card h4{margin:0 0 8px;font:600 13px/1.3 Archivo,sans-serif}
+.card p{font-size:13.5px;color:var(--ink-2);margin:0}
+footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--rule);
+  color:var(--ink-3);font-size:13px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow">P2P MoE · 双段模型放置 · 进度盘点</div>
+  <h1>15 节点部署到哪一步了</h1>
+  <p class="sub">框架已完整，真实数据的规划结论已出，权重正在下发。这一页记录当前状态、验证到什么程度、以及还差什么。</p>
+  <dl class="facts">
+    <div class="fact"><dt>代码</dt><dd>14.1k<small>行，44 个模块</small></dd></div>
+    <div class="fact"><dt>测试</dt><dd>672<small>全部通过</small></dd></div>
+    <div class="fact"><dt>模型</dt><dd>80B<small>Qwen3-Next-A3B</small></dd></div>
+    <div class="fact"><dt>节点</dt><dd>15<small>四个网段</small></dd></div>
+    <div class="fact"><dt>切点 L₀</dt><dd>11<small>p ≥ 97.69%</small></dd></div>
+    <div class="fact"><dt>总拉取</dt><dd>141<small>GB，省 94%</small></dd></div>
+  </dl>
+</header>
+
+<main>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="n">01</span>部署进度</h2>
+
+  <div class="pipe">
+    <div class="step done"><span class="k">✓ 完成</span><span class="t">离线规划</span>
+      <span class="d">真实激活 + 真实拓扑 → plan_deploy.json</span></div>
+    <div class="step done"><span class="k">✓ 完成</span><span class="t">sync</span>
+      <span class="d">代码与依赖到 15 台</span></div>
+    <div class="step done"><span class="k">✓ 完成</span><span class="t">meta</span>
+      <span class="d">控制机拿到 config + tokenizer，11.4 MB</span></div>
+    <div class="step now"><span class="k">← 现在</span><span class="t">fetch</span>
+      <span class="d">15 台各拉自己那份，合计 141 GB</span></div>
+    <div class="step"><span class="k">待做</span><span class="t">start</span>
+      <span class="d">起 15 个 agent，验活</span></div>
+    <div class="step"><span class="k">待做</span><span class="t">measure</span>
+      <span class="d">建链 + 打请求 + 逐请求时序</span></div>
+    <div class="step"><span class="k">待做</span><span class="t">report</span>
+      <span class="d">时延构成与算力使用率</span></div>
+  </div>
+  <div class="pipe-legend">
+    <span><i class="sw" style="background:var(--done)"></i>已完成</span>
+    <span><i class="sw" style="background:var(--now)"></i>进行中</span>
+    <span><i class="sw" style="background:var(--todo)"></i>待做</span>
+  </div>
+
+  <div class="note ok">
+    <p><b>刚打通的一关：取权重的传输链路。</b>节点上 conda 自带的 OpenSSL 握手超时，而系统 <code>curl</code> 能下同一个 URL。现在 <code>fetch</code> 会在 urllib 失败时<b>整轮切到 curl</b>，两条路取回的字节逐字节一致。</p>
+  </div>
+
+  <p>下一步就是 <code>fetch</code> 真正跑完。单台最多 22.4 GB（N08），最少 0.9 GB，<b>没有任何一台需要全模型</b>。</p>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="n">02</span>系统构成</h2>
+  <p class="lede">四个子系统，边界由测试钉死 —— 控制机不装 torch，节点不装 tokenizer。</p>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>子系统</th><th class="num">行数</th><th>做什么</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">planner/</td><td class="num">4265</td>
+          <td>离线算放置：切点 L₀、公共中值域、通道配平、环路裁剪、清单生成</td>
+          <td><span class="chip done">完成</span></td></tr>
+        <tr><td class="mono">runtime/</td><td class="num">4838</td>
+          <td>执行层：Qwen3-MoE 与 Qwen3-Next 前向、选择性加载、在线识别、协调器、文本进出、时序埋点</td>
+          <td><span class="chip done">完成</span></td></tr>
+        <tr><td class="mono">deploy/</td><td class="num">4256</td>
+          <td>部署：节点 agent、批量起停、按张量取权重、中继、局域网权重源、控制器</td>
+          <td><span class="chip done">完成</span></td></tr>
+        <tr><td class="mono">sim/</td><td class="num">708</td>
+          <td>仿真：合成 checkpoint、网络模型、场景回放</td>
+          <td><span class="chip done">完成</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>两条互不包含的依赖</h3>
+  <div class="two">
+    <div class="card">
+      <h4>控制机</h4>
+      <p><code>numpy + tokenizers + jinja2</code>。<b>不装 torch</b> —— 一个张量都不碰。装了就会有人让它"顺手算一层"，那条路一开，时序测量立刻失真。</p>
+    </div>
+    <div class="card">
+      <h4>推理节点</h4>
+      <p><code>numpy + torch + safetensors</code>。<b>不装 tokenizer</b> —— 节点自始至终只见 token id，文本在控制机的入口编码、出口解码。</p>
+    </div>
+  </div>
+  <p>两条边界各有一条测试守着（<code>test_requirements.py</code>）。本轮加 curl 传输时它当场抓到了一次违规：我在 <code>fetch.py</code> 里 import 了 <code>tokenizers</code> 去校验文件，而那个模块跑在 15 台节点上。</p>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="n">03</span>验证到什么程度</h2>
+
+  <div class="bars" id="testbars"></div>
+
+  <div class="note">
+    <p><b>最硬的一条证据：执行层与官方实现逐元素一致。</b>Qwen3-Next 的前向（36 层 Gated DeltaNet + 12 层全注意力、共享专家、零中心 RMSNorm、部分旋转 RoPE）与 transformers 对齐到 prefill 1.7e-05、decode 完全相同、分段切分逐位一致。</p>
+    <p>另一条：<b>驻留集只要包含实际被路由到的专家，输出与全装逐位一致</b> —— 「只驻留子集」不是近似，是无损。</p>
+  </div>
+
+  <h3>还没验的</h3>
+  <ul>
+    <li><b>真权重上的数值</b>。合成 checkpoint 的权重是随机的，验的是机制不是数值。<code>fetch</code> 跑完这一条就能补上。</li>
+    <li><b>真实负载下的时延与算力使用率</b>。这正是 <code>measure</code> 要产出的东西。</li>
+    <li><b>drop-expert 的质量损失</b>。工具已就绪（<code>examples/drop_expert_impact.py</code>），量三件事：miss 率、丢掉的门控质量、输出 KL 与生成分叉步。还没在真权重上跑过。</li>
+  </ul>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="n">04</span>真实数据推翻的三个预期</h2>
+  <p class="lede">三个 CSV（gsm8k / math / mbpp 的逐专家激活）+ 真实 15 节点拓扑，跑出来的结论和方案假设差得不小。</p>
+
+  <div class="note warn">
+    <p><b>① <code>math_expert_activation.csv</code> 有采集 bug，不能用。</b>层 3–47 的专家 0–9（正好 = top_k）计数正常但 <code>mean_weight</code> 是 <code>nan</code>。这些专家在受影响层里占 <b>27–30% 的计数</b>，不是边角。按 0 处理会把它们永远排除在驻留集外，而它们可能恰恰是最热的。gsm8k 与 mbpp 干净。</p>
+  </div>
+
+  <h3>② 激活远没有方案假设的那么集中</h3>
+  <div class="scroll">
+    <table>
+      <thead><tr><th></th><th>文档假设</th><th>实测（90% 覆盖）</th></tr></thead>
+      <tbody>
+        <tr><td>后段每层驻留</td><td>全集的 10–20%</td>
+          <td><b>gsm8k 197/512（38%）、mbpp 224/512（44%）</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>细粒度比 51 说的是「单 token 只碰 2%」，但<b>聚合到整个数据集，热专家的尾巴很长</b>。这一条直接决定了后面所有内存账 —— 3:5 的任务比在这个池子上根本放不下（需要 8 条通道 = 577 GB，池子只有 321 GB）。最终落到 <b>覆盖率 0.70、mbpp 2 条 + gsm8k 1 条</b>。</p>
+
+  <h3>③ 任务重叠度没有拐点</h3>
+  <p>本来想从「前段任务无关、后段任务相关」的分界找 L₀，但逐层 Jaccard 在 48 层里<b>始终在 0.36–0.65 之间震荡，没有趋势</b>（层 0 是 0.603，层 47 是 0.553，周期约 12）。所以改用可识别性 p(L₀)：Bhattacharyya 距离 → Chernoff 界，<b>拐点在 L₀=11，p ≥ 97.69%</b>。</p>
+
+  <div class="note">
+    <p><b>覆盖率与通道数不是单调的。</b>0.70 → 负载比 0.94×，0.60 → 1.25×，0.50 → 0.83×。段的组成是离散的、跳数是整数，所以挨个试比推理快。</p>
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <h2><span class="n">05</span>这一轮排障修掉的 bug</h2>
+  <p class="lede">真机部署把一批只有在真实环境才会现形的问题挖了出来。按类别列，每条都补了回归测试。</p>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>类别</th><th>问题</th><th>为什么难查</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="2"><span class="chip crit">会算错</span></td>
+          <td><b>Qwen3-Next 取错了 key 集合</b><br><span style="color:var(--ink-3)">fetch 用的是 Qwen3-MoE 的命名</span></td>
+          <td>漏掉全部 36 层 DeltaNet 张量与<b>所有共享专家</b>。共享专家缺失<b>不报错</b>，模型照样出 token，只是每层少算一路</td></tr>
+        <tr><td><b>rsync <code>--delete</code> 会抹掉权重</b></td>
+          <td>权重是各节点自己拉的、源端没有 → 一次 <code>sync</code> 静默删掉 141 GB</td></tr>
+
+        <tr><td rowspan="3"><span class="chip crit">跑不通</span></td>
+          <td><b><code>_ssh</code> 硬编码 60 秒超时</b></td>
+          <td>下 22 GB 必然超时。<code>TimeoutExpired</code> 的消息是一整串 argv，读起来像 ssh 坏了</td></tr>
+        <tr><td><b><code>fetch</code> 漏传 <code>--workdir</code></b></td>
+          <td>远端 <code>cd .</code> 落到 ssh 登录目录 → 15 台齐报 <code>No module named 'p2pmoe'</code>，看着像没装</td></tr>
+        <tr><td><b>某 task 分到 0 条后段</b></td>
+          <td>请求排进一个永远没人归还的队列，300 秒后报「超时」，日志只说「池无空闲」，读着像拥塞</td></tr>
+
+        <tr><td rowspan="4"><span class="chip now">诊断误导</span></td>
+          <td><b><code>start</code> 报 ✓ 但进程已死</b></td>
+          <td>PID 只说明 fork 成功。15 台全绿，下一步却全部不可达</td></tr>
+        <tr><td><b>「日志不存在」报成「ssh 不通」</b></td>
+          <td><code>tail</code> 对缺文件返回非零，被 <code>pipefail</code> 当成 ssh 失败 —— 两者修法相反</td></tr>
+        <tr><td><b>报错截断留的是尾巴</b></td>
+          <td><code>msg[-160:]</code> 把「读不到 https://…」切成「ingface.co/…」，看不出是网络错误</td></tr>
+        <tr><td><b>「缺 p2pmoe」与「缺 numpy」混为一谈</b></td>
+          <td>前者要 <code>sync</code>，后者要改 <code>NODE_PY</code></td></tr>
+
+        <tr><td rowspan="4"><span class="chip todo">环境适配</span></td>
+          <td><b>conda 的 OpenSSL 握手超时</b></td>
+          <td>curl 能下同一个 URL —— 两者用的不是同一套 TLS</td></tr>
+        <tr><td><b>curl 路径的 Content-Length 取错</b></td>
+          <td><code>-L</code> 之后头文件有多段，取了 302 那段的长度去切完整 body → <code>Unterminated string at char 263</code></td></tr>
+        <tr><td><b><code>--fail-with-body</code> 要 curl ≥ 7.76</b></td>
+          <td>集群里的 curl 更老，而切换又没粘住 → 同一句话打了五遍</td></tr>
+        <tr><td><b><code>launch</code> 不认识 <code>--transport</code></b></td>
+          <td>参数加在 <code>fetch.py</code> 上，忘了中间那层。同时发现 <code>--base-url</code>/<code>--src</code> 两条路根本没接上</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>顺带补进来的能力</h3>
+  <div class="two">
+    <div class="card"><h4>断点续传</h4>
+      <p>链路中途掐断时按已收字节续。实测每次只传 137 字节也能把 256 KB 拼齐，逐字节一致。</p></div>
+    <div class="card"><h4>curl 传输通道</h4>
+      <p>Python 的 TLS 下不动时整轮改用 curl。切换是粘的 —— 上万个张量不能每次先失败一遍。</p></div>
+    <div class="card"><h4>局域网权重源</h4>
+      <p><code>serve-weights</code>：一台下全量，15 台从它切片。<code>python -m http.server</code> 不支持 Range，用不了。</p></div>
+    <div class="card"><h4>逐台体检</h4>
+      <p><code>doctor</code>：代码 / 解释器 / torch / 权重 / 端口 / 磁盘 / 日志，15 台并行几秒出结果，还会替你找出 conda 里带 torch 的那个解释器。</p></div>
+    <div class="card"><h4>LFS 指针识别</h4>
+      <p><code>GIT_LFS_SKIP_SMUDGE=1</code> 克隆出来的目录看着完全正常，每个分片却只有 130 字节文本。</p></div>
+    <div class="card"><h4>源站诊断</h4>
+      <p><code>diag</code>：小文件与大文件是不是两个域名、CDN 那个通不通。企业白名单漏放 CDN 时用它定位。</p></div>
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <h2><span class="n">06</span>还差什么</h2>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>优先级</th><th>条目</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><span class="chip now">跑完就有</span></td><td>真权重上的数值验证</td>
+          <td>合成 checkpoint 只验了机制。<code>fetch</code> 完成后即可对照</td></tr>
+        <tr><td><span class="chip now">跑完就有</span></td><td>时延与算力使用率</td>
+          <td><code>measure</code> 的产出，工具与报表都已就绪</td></tr>
+        <tr><td><span class="chip todo">P0</span></td><td>画像收敛判据</td>
+          <td>采多少 token 才够，现在全凭手感。应看逐层分布的 TV 距离随样本量的变化</td></tr>
+        <tr><td><span class="chip todo">P0</span></td><td>增量补拉与断点续</td>
+          <td>改了覆盖率之后只补差额，而不是重下整份</td></tr>
+        <tr><td><span class="chip todo">P1</span></td><td>采样策略</td>
+          <td>现在后段 tail 是 argmax。要 temperature / top-p / repetition penalty 与可复现的种子口径</td></tr>
+        <tr><td><span class="chip todo">P1</span></td><td>连续批处理</td>
+          <td>当前是每条通道排他独占一条请求</td></tr>
+        <tr><td><span class="chip todo">P1</span></td><td>通道一（SPRT）与三层维护</td>
+          <td>方案里的在线自适应部分，目前是静态放置 + 盲绑 + 换绑</td></tr>
+        <tr><td><span class="chip todo">P2</span></td><td>中继横向扩展、池合并、方向不对称修正</td>
+          <td>都有明确的触发条件，现在还没到</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <p><b>一条要反馈给方案作者的偏差：</b>文档假设后段驻留集是全集的 10–20%，实测是 38–44%。这不是实现问题，是数据的性质 —— 但它让「3:5 任务比」这类基于内存账的设计目标在真实池子上放不下。后续的容量规划都该按实测值重估。</p>
+  </div>
+</section>
+
+<footer>
+  运行手册见 <code>RUNBOOK.md</code>（也有<a href="https://claude.ai/code/artifact/671a3980-fbd9-4cf5-b79e-162eec122439">网页版</a>），设计与取舍在 <code>DEPLOY.md</code>，算法在 <code>task.docx</code>，待办在 <code>TODO.md</code>。
+</footer>
+
+</main>
+</div>
+
+<script>
+const TESTS = [
+  {k:"规划器", n:290, d:"离线算放置"},
+  {k:"部署与取权重", n:193, d:"本轮增加最多"},
+  {k:"执行层", n:95, d:"真模型前向"},
+  {k:"服务环路", n:69, d:"在线识别与派发"},
+  {k:"网络与中继", n:15, d:""},
+  {k:"架构边界", n:10, d:"依赖不互相污染"},
+];
+const max = Math.max(...TESTS.map(t => t.n));
+document.getElementById("testbars").innerHTML =
+  TESTS.map(t => `<div class="bar">
+      <div class="bar-lab">${t.k}${t.d ? `<br><span style="font-size:11px;color:var(--ink-3)">${t.d}</span>` : ""}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${(t.n / max * 100).toFixed(1)}%"></div></div>
+      <div class="bar-n">${t.n}</div>
+    </div>`).join("") +
+  `<div class="bar" style="margin-top:12px;padding-top:11px;border-top:1px solid var(--rule-soft)">
+     <div class="bar-lab" style="font-weight:600;color:var(--ink)">合计</div>
+     <div></div><div class="bar-n" style="font-weight:600;color:var(--ink)">672</div>
+   </div>`;
+</script>

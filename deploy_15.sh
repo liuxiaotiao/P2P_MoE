@@ -73,6 +73,7 @@ SRC_URL=${SRC_URL:-}
 TRANSPORT=${TRANSPORT:-auto}
 MODE=${MODE:-slice}                             # slice=逐张量；shard=整分片（源站不支持 Range 时）
 FETCH_TIMEOUT=${FETCH_TIMEOUT:-14400}           # 单节点下载超时（秒）
+PROGRESS_EVERY=${PROGRESS_EVERY:-30}            # 下载期间多久报一次进度（0=关）
 PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
 RESULTS=${RESULTS:-results/run.json}            # 逐请求结果落盘
 WARMUP=${WARMUP:-2}                             # measure 前丢掉几条（冷启动）
@@ -412,11 +413,14 @@ cmd_fetch() {
 
   say "3b. 15 台一起下"
   echo "  单台最多 22.4GB，视带宽可能要几十分钟到几小时。"
-  echo "  超时上限 ${FETCH_TIMEOUT:-14400}s（--timeout），不够就调大。"
+  echo "  超时上限 ${FETCH_TIMEOUT}s（FETCH_TIMEOUT=），不够就调大。"
+  echo "  每 ${PROGRESS_EVERY}s 报一次逐台进度（PROGRESS_EVERY=0 关掉）——"
+  echo "  问的是目录大小，所以「进程还在但一个字节没动」也看得见。"
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
       --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
       --mode "$MODE" --timeout "$FETCH_TIMEOUT" --transport "$TRANSPORT" \
+      --progress-every "$PROGRESS_EVERY" \
       "${SSHARG[@]}" "${SRCARG[@]}"
 }
 

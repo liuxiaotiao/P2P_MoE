@@ -1,0 +1,362 @@
+<title>Two-Segment MoE Placement</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#F4F6F8; --surface:#FFFFFF; --sunken:#EAEEF2;
+  --ink:#161C22; --ink-2:#3E4A55; --ink-3:#6B7883;
+  --rule:#D7DEE5; --rule-soft:#E6EBF0;
+  --accent:#0B6E7F; --accent-soft:#E0F0F3;
+  --done:#2A6F53; --done-soft:#DFEDE7;
+  --front:#0B6E7F; --back:#9A5B14; --spare:#8892A0;
+  --crit:#A3282B; --crit-soft:#F8E5E5;
+  --shadow:0 1px 2px rgba(22,28,34,.06), 0 8px 24px -12px rgba(22,28,34,.18);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F1418; --surface:#171E24; --sunken:#1E272E;
+    --ink:#E6ECF1; --ink-2:#AFBCC7; --ink-3:#7C8994;
+    --rule:#2C3841; --rule-soft:#232D35;
+    --accent:#4FC3D6; --accent-soft:#12323A;
+    --done:#5FBF92; --done-soft:#123028;
+    --front:#4FC3D6; --back:#D9A25A; --spare:#7C8994;
+    --crit:#E48285; --crit-soft:#3A1E1F;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F1418; --surface:#171E24; --sunken:#1E272E;
+  --ink:#E6ECF1; --ink-2:#AFBCC7; --ink-3:#7C8994;
+  --rule:#2C3841; --rule-soft:#232D35;
+  --accent:#4FC3D6; --accent-soft:#12323A;
+  --done:#5FBF92; --done-soft:#123028;
+  --front:#4FC3D6; --back:#D9A25A; --spare:#7C8994;
+  --crit:#E48285; --crit-soft:#3A1E1F;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font:400 16px/1.68 "IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  -webkit-font-smoothing:antialiased}
+h1,h2,h3{font-family:Archivo,"IBM Plex Sans",system-ui,sans-serif;
+  text-wrap:balance;margin:0}
+code,pre,.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+
+.wrap{max-width:1040px;margin:0 auto;padding:0 24px 96px}
+.mast{border-bottom:1px solid var(--rule);margin-bottom:38px;padding:52px 0 30px}
+.eyebrow{font:600 11px/1 "IBM Plex Mono",monospace;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--accent);margin-bottom:14px}
+.mast h1{font-size:clamp(30px,4.6vw,46px);font-weight:700;letter-spacing:-.022em;line-height:1.08}
+.mast .sub{color:var(--ink-2);font-size:17.5px;margin-top:14px;max-width:64ch}
+
+section{margin-bottom:54px;scroll-margin-top:24px}
+section>h2{font-size:22px;font-weight:600;letter-spacing:-.012em;
+  padding-bottom:10px;border-bottom:2px solid var(--ink);margin-bottom:20px;
+  display:flex;align-items:baseline;gap:12px}
+section>h2 .n{font:600 11px/1 "IBM Plex Mono",monospace;color:var(--accent);
+  letter-spacing:.1em;flex:none}
+h3{font-size:15px;font-weight:600;margin:28px 0 10px}
+p{margin:0 0 14px;max-width:70ch} p:last-child{margin-bottom:0}
+ul{margin:0 0 14px;padding-left:20px;max-width:68ch} li{margin-bottom:6px}
+.lede{font-size:17px;color:var(--ink-2);max-width:66ch}
+code:not(pre code){background:var(--sunken);padding:.1em .38em;border-radius:3px;
+  font-size:.875em;border:1px solid var(--rule-soft)}
+
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));
+  gap:1px;background:var(--rule-soft);border:1px solid var(--rule-soft);
+  border-radius:8px;overflow:hidden;margin:32px 0 0}
+.fact{background:var(--surface);padding:14px 16px}
+.fact dt{font:600 10px/1 "IBM Plex Mono",monospace;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3)}
+.fact dd{margin:8px 0 0;font:600 21px/1.1 Archivo,sans-serif;font-variant-numeric:tabular-nums}
+.fact dd small{font-size:11.5px;font-weight:500;color:var(--ink-3);display:block;
+  margin-top:5px;font-family:"IBM Plex Sans",sans-serif;letter-spacing:0}
+
+/* layer map */
+.map{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:20px 22px 16px;margin:0 0 18px}
+.map-legend{display:flex;flex-wrap:wrap;gap:16px;align-items:center;
+  font-size:11.5px;color:var(--ink-3);margin-bottom:18px}
+.map-legend span{display:flex;align-items:center;gap:6px}
+.sw{width:11px;height:11px;border-radius:2.5px;flex:none}
+.map-row{display:grid;grid-template-columns:96px minmax(0,1fr);gap:14px;
+  align-items:center;margin-bottom:7px}
+.map-lab{font:600 11px/1.3 "IBM Plex Mono",monospace;color:var(--ink-2);text-align:right}
+.map-track{position:relative;height:24px;background:var(--sunken);border-radius:4px;
+  overflow:hidden;border:1px solid var(--rule-soft)}
+.seg{position:absolute;top:0;height:100%;display:flex;align-items:center;
+  justify-content:center;font:600 10px/1 "IBM Plex Mono",monospace;color:#fff;
+  overflow:hidden;white-space:nowrap;border-right:1px solid rgba(0,0,0,.28)}
+.seg.f{background:var(--front)} .seg.b{background:var(--back)} .seg.s{background:var(--spare)}
+.cut{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--crit);
+  z-index:3;border-radius:1px}
+.map-axis{display:grid;grid-template-columns:96px minmax(0,1fr);gap:14px;
+  margin-top:12px;padding-top:10px;border-top:1px solid var(--rule-soft)}
+.axis-track{position:relative;height:15px;font:500 10px/1 "IBM Plex Mono",monospace;
+  color:var(--ink-3)}
+.axis-track i{position:absolute;font-style:normal;transform:translateX(-50%)}
+
+/* bars */
+.bars{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:18px 20px 14px;margin:0 0 18px}
+.bar{display:grid;grid-template-columns:190px minmax(0,1fr) 46px;gap:12px;
+  align-items:center;margin-bottom:10px;font-size:13.5px}
+.bar-lab{color:var(--ink-2);line-height:1.35}
+.bar-lab em{font-style:normal;font-size:11px;color:var(--ink-3);display:block}
+.bar-track{height:20px;background:var(--sunken);border-radius:4px;overflow:hidden;
+  border:1px solid var(--rule-soft)}
+.bar-fill{height:100%;background:var(--accent)}
+.bar-n{text-align:right;font-variant-numeric:tabular-nums;
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--ink-2)}
+
+.scroll{overflow-x:auto;margin:0 0 18px;border:1px solid var(--rule);
+  border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:10px 13px;text-align:left;border-bottom:1px solid var(--rule-soft);
+  vertical-align:top}
+thead th{font:600 10px/1.3 "IBM Plex Mono",monospace;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);background:var(--sunken);white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td.mono{font-family:"IBM Plex Mono",monospace;font-size:12.5px}
+td.num{text-align:right;font-variant-numeric:tabular-nums;
+  font-family:"IBM Plex Mono",monospace}
+
+.chip{display:inline-block;padding:2.5px 8px;border-radius:20px;
+  font:600 10.5px/1.35 "IBM Plex Mono",monospace;letter-spacing:.04em;white-space:nowrap}
+.chip.done{background:var(--done-soft);color:var(--done)}
+
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);
+  padding:14px 16px;border-radius:0 6px 6px 0;margin:0 0 18px;font-size:14.5px}
+.note.ok{border-left-color:var(--done);background:var(--done-soft)}
+.note.warn{border-left-color:var(--crit);background:var(--crit-soft)}
+.note p{max-width:66ch}
+
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));
+  gap:16px;margin-bottom:18px}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:16px 18px}
+.card h4{margin:0 0 8px;font:600 13px/1.3 Archivo,sans-serif}
+.card p{font-size:13.5px;color:var(--ink-2);margin:0}
+footer{margin-top:54px;padding-top:20px;border-top:1px solid var(--rule);
+  color:var(--ink-3);font-size:13px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow">Built &amp; Verified</div>
+  <h1>Two-Segment MoE Placement</h1>
+  <p class="sub">Serving an 80B fine-grained MoE across a pool of decentralized GPUs, where no single machine holds the model. This page records what exists and how it was verified.</p>
+  <dl class="facts">
+    <div class="fact"><dt>Code</dt><dd>14.1k<small>lines, 44 modules</small></dd></div>
+    <div class="fact"><dt>Tests</dt><dd>672<small>all passing</small></dd></div>
+    <div class="fact"><dt>Model</dt><dd>80B<small>Qwen3-Next-A3B</small></dd></div>
+    <div class="fact"><dt>Pool</dt><dd>15<small>nodes, 24 GB each</small></dd></div>
+    <div class="fact"><dt>Split at</dt><dd>L₀ 11<small>of 48 layers</small></dd></div>
+    <div class="fact"><dt>Total pull</dt><dd>141<small>GB, 94% saved</small></dd></div>
+  </dl>
+</header>
+
+<main>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="n">01</span>The idea, in one screen</h2>
+  <p class="lede">Split the model by layer. The front half is task-agnostic; the back half is task-specific and only resident for the experts that task actually uses.</p>
+
+  <div class="map">
+    <div class="map-legend">
+      <span><i class="sw" style="background:var(--front)"></i>Front — task-agnostic, union of experts</span>
+      <span><i class="sw" style="background:var(--back)"></i>Back — per-task, hot experts only</span>
+      <span><i class="sw" style="background:var(--spare)"></i>Standby front</span>
+      <span><i class="sw" style="background:var(--crit);width:3px;height:13px;border-radius:1px"></i>L₀ = 11</span>
+    </div>
+    <div id="layermap"></div>
+    <div class="map-axis"><div></div><div class="axis-track" id="axis"></div></div>
+  </div>
+
+  <p>A request lands on any front chain. While computing layers 1–11 the front <b>identifies the task online</b> from its own routing histogram, then dispatches to a back chain for that task. Seven chains across 15 nodes: three fronts plus one standby, two <code>mbpp</code> backs and one <code>gsm8k</code> back.</p>
+
+  <div class="note ok">
+    <p><b>The whole pool pulls less than one full copy.</b> 141 GB against a 160 GB model — because every front holds only 11 of 48 layers, and every back keeps only the experts covering 70% of activation mass. The heaviest single node carries 22.4 GB; the lightest, 0.9 GB.</p>
+  </div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="n">02</span>What is built</h2>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Subsystem</th><th class="num">Lines</th><th>Responsibility</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">planner/</td><td class="num">4,265</td>
+          <td>Offline placement: choosing L₀, the common-median band, integer channel allotment, loop trimming, manifest generation</td>
+          <td><span class="chip done">complete</span></td></tr>
+        <tr><td class="mono">runtime/</td><td class="num">4,838</td>
+          <td>Execution: Qwen3-MoE and Qwen3-Next forward passes, selective weight loading, online task identification, the coordinator, text in/out, per-request timing</td>
+          <td><span class="chip done">complete</span></td></tr>
+        <tr><td class="mono">deploy/</td><td class="num">4,256</td>
+          <td>Operations: node agent, batch start/stop, byte-range weight fetch, relay for NAT'd nodes, LAN weight source, controller</td>
+          <td><span class="chip done">complete</span></td></tr>
+        <tr><td class="mono">sim/</td><td class="num">708</td>
+          <td>Simulation: synthetic checkpoints, network model, scenario replay</td>
+          <td><span class="chip done">complete</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Capabilities that carry the design</h3>
+  <div class="two">
+    <div class="card"><h4>Tensor-level fetch</h4>
+      <p>Read a safetensors header, compute which byte ranges hold the wanted tensors, pull only those. 141 GB across the pool instead of 2,400 GB.</p></div>
+    <div class="card"><h4>Partial expert residency</h4>
+      <p>A layer can hold any subset of its experts. Three policies when a routed expert is absent: drop with gate renormalization, drop without, or re-take top-k among residents.</p></div>
+    <div class="card"><h4>Online task identification</h4>
+      <p>The front classifies from its own routing histogram against per-task activation profiles — no separate classifier model, no extra forward pass.</p></div>
+    <div class="card"><h4>Blind binding</h4>
+      <p>An arriving request takes the queue-head front with no comparison at all. Identification happens during the front pass; dispatch waits until it commits.</p></div>
+    <div class="card"><h4>Relay for NAT'd nodes</h4>
+      <p>Parked outbound connections spliced byte-for-byte. Neither side needs an inbound port, and the layer above cannot tell a relay is in the path.</p></div>
+    <div class="card"><h4>Per-request timing</h4>
+      <p>Compute measured locally as durations only; network inferred as the residual. Fifteen machines have no synchronized clock, so cross-machine instants are never claimed.</p></div>
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="n">03</span>How it is verified</h2>
+  <p class="lede">672 tests. The distribution says where the risk was judged to be.</p>
+
+  <div class="bars" id="testbars"></div>
+
+  <h3>The two strongest results</h3>
+
+  <div class="note ok">
+    <p><b>The execution layer matches the reference implementation element-wise.</b> Qwen3-Next's forward pass — 36 Gated DeltaNet layers interleaved with 12 full-attention layers, an always-active shared expert, zero-centered RMSNorm, partial rotary RoPE — is compared against <code>transformers</code> layer by layer. Assertion threshold 1e-3; measured maximum absolute difference 1.7e-05 on prefill, identical token sequences through 24 decode steps, and splitting the model across segment boundaries changes nothing.</p>
+  </div>
+
+  <div class="note ok">
+    <p><b>Partial residency is lossless, not approximate.</b> When the resident set contains every expert the router actually selects, the output is <em>bit-identical</em> to the fully-loaded model — <code>torch.equal</code>, not a tolerance. The approximation only begins when a routed expert is genuinely absent, and that case is measured separately.</p>
+  </div>
+
+  <h3>What each area proves</h3>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Area</th><th class="num">Tests</th><th>What is established</th></tr></thead>
+      <tbody>
+        <tr><td>Planner</td><td class="num">290</td>
+          <td>Placement respects memory and hop bounds; the common-median band and loop trim reach their proven optima; manifests round-trip byte-exactly; property tests over randomized pools and topologies</td></tr>
+        <tr><td>Deployment &amp; fetch</td><td class="num">193</td>
+          <td>Downloader and loader agree on the exact key set for both model families; byte ranges reassemble into valid safetensors; range support is detected rather than assumed; resumed transfers are byte-identical to unbroken ones</td></tr>
+        <tr><td>Execution</td><td class="num">95</td>
+          <td>Element-wise parity with <code>transformers</code>; bit-exact partial residency; the three miss policies differ measurably; selective loading opens only the shards it needs</td></tr>
+        <tr><td>Serving loop</td><td class="num">69</td>
+          <td>Blind bind, identify, dispatch, rebind on miss alarm; bounded waiting; exclusive channel occupancy; text encode/decode including UTF-8 characters split across tokens</td></tr>
+        <tr><td>Network &amp; relay</td><td class="num">15</td>
+          <td>The layer above cannot distinguish a relayed link: same framing, same binary payloads, no truncation on multi-megabyte hidden states</td></tr>
+        <tr><td>Architecture</td><td class="num">10</td>
+          <td>The control machine never imports torch; inference nodes never import a tokenizer; the data plane never spawns a subprocess and never needs SSH between nodes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <p><b>Scope of these numbers.</b> Parity is established against synthetic checkpoints with real key naming and real layer structure — the mechanism is proven, the numerics of the actual 80B weights are not yet checked. End-to-end latency and compute utilization under real load are instrumented and reported by the tooling, but not yet measured on the pool.</p>
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="n">04</span>The planning run on real data</h2>
+  <p class="lede">Per-expert activation counts for gsm8k, math and mbpp, plus a measured 15-node topology with bandwidths and propagation delays. Three findings, each of which changed the design.</p>
+
+  <h3>Activation is far less concentrated than assumed</h3>
+  <div class="scroll">
+    <table>
+      <thead><tr><th></th><th>Design assumption</th><th>Measured, at 90% coverage</th></tr></thead>
+      <tbody>
+        <tr><td>Resident experts per back-segment layer</td>
+          <td>10–20% of the full set</td>
+          <td><b>gsm8k 197/512 (38%), mbpp 224/512 (44%)</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>A granularity ratio of 51 means a <em>single token</em> touches only 2% of the experts — but aggregated over a dataset, the tail of hot experts is long. This one number decides every memory budget downstream: a 3:5 task mix needs 8 channels at 577 GB, and the pool holds 321 GB. The deployed configuration settles at <b>70% coverage, two mbpp chains and one gsm8k chain</b>, with load at 0.94× capacity.</p>
+
+  <h3>Task overlap has no inflection point</h3>
+  <p>The intended way to pick L₀ was to find where per-task expert sets stop overlapping. They never do: layer-wise Jaccard oscillates between 0.36 and 0.65 across all 48 layers with no trend (0.603 at layer 0, 0.553 at layer 47, period roughly 12). L₀ is instead chosen by <b>identifiability</b> — Bhattacharyya distance between per-task routing distributions, bounded via Chernoff — which puts the knee at <b>L₀ = 11 with p ≥ 97.69%</b>.</p>
+
+  <h3>Coverage and channel count are not monotone</h3>
+  <p>Load-to-capacity is 0.94× at coverage 0.70, 1.25× at 0.60, 0.83× at 0.50. Segment composition is discrete and hop counts are integers, so the relationship is not smooth — configurations are worth enumerating rather than reasoning about.</p>
+
+  <div class="note warn">
+    <p><b>One dataset is unusable.</b> In <code>math_expert_activation.csv</code>, experts 0–9 — exactly <code>top_k</code> — carry non-zero counts but <code>NaN</code> mean weights across layers 3–47, accounting for 27–30% of counts in the affected layers. Treating them as zero would permanently exclude what may be the hottest experts. The gsm8k and mbpp collections are clean; the deployment uses only those two.</p>
+  </div>
+</section>
+
+<footer>
+  Operating procedure in <code>RUNBOOK.md</code> (also a <a href="https://claude.ai/code/artifact/671a3980-fbd9-4cf5-b79e-162eec122439">web version</a>). Design rationale in <code>DEPLOY.md</code>; the algorithm in <code>task.docx</code>.
+</footer>
+
+</main>
+</div>
+
+<script>
+const NODES = [
+  {id:"N01", seg:"F0",         a:1,  b:1,  k:"f"},
+  {id:"N07", seg:"F0",         a:2,  b:10, k:"f"},
+  {id:"N10", seg:"F0",         a:11, b:11, k:"f"},
+  {id:"N11", seg:"F1",         a:1,  b:11, k:"f"},
+  {id:"N09", seg:"F2",         a:1,  b:11, k:"f"},
+  {id:"N13", seg:"F-standby0", a:1,  b:8,  k:"s"},
+  {id:"N14", seg:"F-standby0", a:9,  b:9,  k:"s"},
+  {id:"N15", seg:"F-standby0", a:10, b:10, k:"s"},
+  {id:"N12", seg:"F-standby0", a:11, b:11, k:"s"},
+  {id:"N03", seg:"Bmbpp0",     a:12, b:20, k:"b"},
+  {id:"N04", seg:"Bmbpp0",     a:21, b:48, k:"b"},
+  {id:"N05", seg:"Bmbpp1",     a:12, b:20, k:"b"},
+  {id:"N02", seg:"Bmbpp1",     a:21, b:48, k:"b"},
+  {id:"N06", seg:"Bgsm8k0",    a:12, b:14, k:"b"},
+  {id:"N08", seg:"Bgsm8k0",    a:15, b:48, k:"b"},
+];
+const L = 48, L0 = 11, pct = n => (n / L) * 100;
+const ORDER = ["F0","F1","F2","F-standby0","Bmbpp0","Bmbpp1","Bgsm8k0"];
+
+document.getElementById("layermap").innerHTML = ORDER.map(sid => {
+  const bars = NODES.filter(n => n.seg === sid).sort((x, y) => x.a - y.a).map(n => {
+    const w = pct(n.b - n.a + 1);
+    return `<div class="seg ${n.k}" style="left:${pct(n.a-1)}%;width:${w}%"
+      title="${n.id} · layers ${n.a}–${n.b}">${w > 7 ? n.id : ""}</div>`;
+  }).join("");
+  return `<div class="map-row"><div class="map-lab">${sid}</div>
+    <div class="map-track">${bars}<div class="cut" style="left:${pct(L0)}%"></div></div></div>`;
+}).join("");
+
+document.getElementById("axis").innerHTML =
+  [1, 11, 20, 30, 40, 48].map(v => `<i style="left:${pct(v - .5)}%">${v}</i>`).join("");
+
+const TESTS = [
+  {k:"Planner",              d:"offline placement",        n:290},
+  {k:"Deployment & fetch",   d:"weights, agents, sources", n:193},
+  {k:"Execution",            d:"real-model forward pass",  n:95},
+  {k:"Serving loop",         d:"identify and dispatch",    n:69},
+  {k:"Network & relay",      d:"",                         n:15},
+  {k:"Architecture",         d:"dependency boundaries",    n:10},
+];
+const max = Math.max(...TESTS.map(t => t.n));
+document.getElementById("testbars").innerHTML =
+  TESTS.map(t => `<div class="bar">
+    <div class="bar-lab">${t.k}${t.d ? `<em>${t.d}</em>` : ""}</div>
+    <div class="bar-track"><div class="bar-fill" style="width:${(t.n / max * 100).toFixed(1)}%"></div></div>
+    <div class="bar-n">${t.n}</div></div>`).join("") +
+  `<div class="bar" style="margin-top:12px;padding-top:11px;border-top:1px solid var(--rule-soft)">
+     <div class="bar-lab" style="font-weight:600;color:var(--ink)">Total</div><div></div>
+     <div class="bar-n" style="font-weight:600;color:var(--ink)">672</div></div>`;
+</script>
