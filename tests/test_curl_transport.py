@@ -293,3 +293,78 @@ def test_curl_availability_is_actually_probed(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("p2pmoe.deploy.fetch.subprocess.run",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
     assert s._have_curl() is False
+
+
+# --------------------------------------------------------------------------- #
+# 7. 跟随重定向时，头文件里有多段响应
+# --------------------------------------------------------------------------- #
+def test_headers_after_a_redirect_use_the_last_response() -> None:
+    """**真踩过。**
+
+    `curl -D` 落下来的头文件里，跟随重定向时有多段。取第一段（302）的
+    `Content-Length` 当文件总长，再拿它去切完整的 body —— 得到一个被腰斩的
+    JSON，报错是 `Unterminated string starting at char 263`，
+    而 263 正是那个 302 响应体的长度。离真正的原因隔了三层。
+    """
+    from p2pmoe.deploy.fetch import _last_response, _total_from_headers
+
+    hdr = ("HTTP/1.1 302 Found\r\n"
+           "Location: https://cdn.example/abc\r\n"
+           "Content-Length: 263\r\n\r\n"
+           "HTTP/1.1 200 OK\r\n"
+           "Content-Length: 1547\r\n\r\n")
+    assert _total_from_headers(hdr) == 1547
+    assert _last_response(hdr)[0].startswith("HTTP/1.1 200")
+
+
+def test_content_range_beats_content_length() -> None:
+    """分段响应里 Content-Length 只是这一段的长度，Content-Range 的分母才是全长。"""
+    from p2pmoe.deploy.fetch import _total_from_headers
+
+    hdr = ("HTTP/1.1 206 Partial Content\r\n"
+           "Content-Range: bytes 0-99/4294967296\r\n"
+           "Content-Length: 100\r\n\r\n")
+    assert _total_from_headers(hdr) == 4294967296
+
+
+def test_a_redirect_does_not_truncate_the_body(tmp_path) -> None:
+    """端到端：302 → 200 的完整链路上，取回来的必须是整个文件。"""
+    import http.server
+    import json as _json
+    import socketserver
+    import threading
+
+    payload = _json.dumps({"model_type": "qwen3_next",
+                           "note": "x" * 3000}).encode()
+    real = WeightServer(tmp_path, "127.0.0.1", 0)
+    (tmp_path / "config.json").write_bytes(payload)
+    real.start()
+
+    class Redir(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _go(self):
+            body = b"moved" * 52          # 260 字节，模仿那个 263
+            self.send_response(302)
+            self.send_header("Location",
+                             f"http://127.0.0.1:{real.port}{self.path}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command == "GET":
+                self.wfile.write(body)
+
+        do_GET = _go
+        do_HEAD = _go
+
+    front = socketserver.TCPServer(("127.0.0.1", 0), Redir)
+    threading.Thread(target=front.serve_forever, daemon=True).start()
+    try:
+        s = Source(base_url=f"http://127.0.0.1:{front.server_address[1]}",
+                   transport="curl", timeout=20)
+        assert s.read("config.json") == payload, "重定向之后被截断了"
+        assert s.read_json("config.json")["model_type"] == "qwen3_next"
+    finally:
+        front.shutdown()
+        front.server_close()
+        real.stop()

@@ -72,15 +72,36 @@ _HDR_MAX = 200 << 20  # 文件头上限，防止畸形文件把内存吃光
 
 
 # --------------------------------------------------------------------------- #
-def _total_from_headers(text: str) -> int:
-    """从响应头里读文件总长。Content-Range 优先 —— 只有它在分段响应里也是全长。"""
-    total = 0
+def _last_response(text: str) -> list[str]:
+    """curl -D 落下来的头文件里，跟随重定向时有**多段**响应。只有最后一段
+    描述真正拿到的那个 body。
+
+    真踩过：取第一段的 `Content-Length`（302 响应体的长度，几百字节）当成
+    文件总长，然后拿它去切完整的 config.json —— 得到一个被腰斩的 JSON，
+    报错是 `Unterminated string starting at char 263`，离原因隔了三层。
+    """
+    blocks: list[list[str]] = []
     for line in text.splitlines():
+        if line.startswith("HTTP/"):
+            blocks.append([])
+        if blocks:
+            blocks[-1].append(line)
+    return blocks[-1] if blocks else []
+
+
+def _total_from_headers(text: str) -> int:
+    """从**最后一段**响应头里读文件总长。
+
+    Content-Range 优先：`bytes 0-99/12345` 里的 12345 是全长，
+    而分段响应的 Content-Length 只是这一段的长度。
+    """
+    total = 0
+    for line in _last_response(text):
         low = line.lower()
         if low.startswith("content-range:"):
             tail = line.rpartition("/")[2].strip()
             if tail.isdigit():
-                total = int(tail)
+                return int(tail)          # 全长，最可靠，直接用
         elif low.startswith("content-length:") and not total:
             v = line.partition(":")[2].strip()
             if v.isdigit():
@@ -261,10 +282,14 @@ class Source:
             cmd.append(f"{self.base}/{name}")
             r = subprocess.run(cmd, capture_output=True, timeout=self.timeout + 30)
             text = hdr.read_text(errors="replace") if hdr.exists() else ""
-            # -L 之后 header 文件里有多段，最后一段才是最终响应
-            codes = [int(l.split()[1]) for l in text.splitlines()
-                     if l.startswith("HTTP/") and len(l.split()) > 1]
-            status = codes[-1] if codes else 0
+            # -L 之后 header 文件里有多段，**最后一段**才描述真正拿到的 body
+            last = _last_response(text)
+            status = 0
+            if last and len(last[0].split()) > 1:
+                try:
+                    status = int(last[0].split()[1])
+                except ValueError:
+                    status = 0
             if r.returncode != 0:
                 raise OSError(f"curl 退出码 {r.returncode}："
                               f"{r.stderr.decode(errors='replace').strip()[:200]}")
