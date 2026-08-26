@@ -299,8 +299,46 @@ PYEOF
   $PY -m p2pmoe.deploy.launch probe --hosts "$HOSTS" --k 8 "${SSHARG[@]}" || true
 }
 
+# 开跑之前先确认 NODE_PY 指对了。
+#
+# 默认值是 `python3`，而 torch 装在 conda 环境里时那是系统 python ——
+# 看不见环境里的包。这个错要到「已经 ssh 过去、已经开始跑」才暴露，
+# 而那时的报错（No module named 'numpy'）看着像代码没同步，不像解释器选错。
+_require_node_py() {
+  local first firstip
+  first=$(awk '{sub(/#.*/,"")} NF>=2 {print $1; exit}' "$HOSTS")
+  firstip=$(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print a[1]; exit}' "$HOSTS")
+  [ -n "$firstip" ] || return 0
+  local out rc
+  out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+          "${SSH_USER:+$SSH_USER@}$firstip" \
+          "$(printf %q "$NODE_PY") -c 'import numpy,torch,safetensors;\
+print(\"ok\", numpy.__version__, torch.__version__)'" \
+          </dev/null 2>&1) && rc=0 || rc=$?
+  if [ "$rc" = 0 ]; then
+    echo "  NODE_PY ✓ $NODE_PY —— ${out}（在 $first 上验的）"
+    return 0
+  fi
+  echo "  ✗ NODE_PY 用不了：$NODE_PY"
+  echo "    在 $first 上跑 \`\$NODE_PY -c 'import numpy,torch'\` 得到："
+  echo "$out" | head -3 | sed 's/^/      /'
+  case "$NODE_PY" in
+    python3|python)
+      echo "    这是**系统 python**。torch 在 conda 环境里的话它看不见 ——"
+      echo "    ssh 起的是非交互 shell，不执行 conda init，"
+      echo "    \`conda activate\` 在那里不存在。要填绝对路径：" ;;
+    *) echo "    这个解释器里缺依赖。换一个，或在它里面装：" ;;
+  esac
+  echo
+  echo "        export NODE_PY=/home/ubuntu/anaconda3/envs/${CONDA_ENV:-moe}/bin/python"
+  echo
+  echo "    不确定路径：bash ./deploy_15.sh doctor —— 它会在各节点上找出来。"
+  return 1
+}
+
 cmd_fetch() {
   say "3. 各节点只拉自己那份权重"
+  _require_node_py || return 1
   # 来源三选一
   SRCARG=()
   local ep
@@ -353,8 +391,20 @@ cmd_fetch() {
         echo "    源站不支持 Range 请求 —— 「只拉需要的张量」这件事做不成。"
         echo "    换一个支持 Range 的镜像，或者退到整分片模式（省得少但能跑）：" 
         echo "        MODE=shard bash ./deploy_15.sh fetch" ;;
-      *"No module named"*)
+      *"No module named 'p2pmoe'"*|*'No module named "p2pmoe"'*)
         echo "    代码不在 $WORKDIR —— 先 bash ./deploy_15.sh sync" ;;
+      *"No module named"*)
+        # 找得到 p2pmoe 却缺别的（numpy/torch/safetensors）——
+        # 代码在，是**解释器不对**。这两件事的修法完全相反：
+        # 前者要 sync，后者要改 NODE_PY。混成一句会把人送去错的方向。
+        echo "    代码在，但这个解释器里缺依赖 —— **NODE_PY 指错了**。"
+        echo "    当前 NODE_PY = $NODE_PY"
+        case "$NODE_PY" in
+          python3|python) echo "    这是系统 python，看不见 conda 环境里的包。" ;;
+        esac
+        echo "    torch 在 conda 环境里的话要填**绝对路径**："
+        echo "        export NODE_PY=/home/ubuntu/anaconda3/envs/${CONDA_ENV:-moe}/bin/python"
+        echo "    不确定路径就跑：bash ./deploy_15.sh doctor" ;;
     esac
     return 1
   fi
@@ -372,6 +422,7 @@ cmd_fetch() {
 
 cmd_start() {
   say "4. 起 agent"
+  _require_node_py || return 1
   $PY -m p2pmoe.deploy.launch start --hosts "$HOSTS" --workdir "$WORKDIR" \
       --python "$NODE_PY" "${SSHARG[@]}"
   sleep 5
