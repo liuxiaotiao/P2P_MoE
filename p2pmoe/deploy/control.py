@@ -234,6 +234,31 @@ class ModelSetup:
     动态模式的分类器要从它构造 —— 见 main() 里 clf 的分支。"""
 
 
+def load_cases(path: Path, tasks: Sequence[str]) -> list[tuple[str | None, str]]:
+    """读测试集文件 → [(真实 task 或 None, prompt), ...]。
+
+    格式：一行一条。想标注真实 task 就写 `mbpp<TAB>prompt` —— 标注只用来
+    核对在线识别对不对，**不影响派发**（派发靠前段自己识别，那才是被测的东西）。
+
+    制表符前的字段只有**在 tasks 里认识**时才当成标注。否则整行都是 prompt ——
+    正文里出现制表符不该被误读成标注，而这在代码类 prompt 里很常见。
+    """
+    known = set(tasks)
+    cases: list[tuple[str | None, str]] = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        # 先只去行尾换行 —— rstrip() 会把 `mbpp<TAB>` 末尾的制表符也吃掉，
+        # 于是「有标注、prompt 为空」这一行会被误判成「没标注」。
+        ln = ln.rstrip("\r\n")
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        head, tab, rest = ln.partition("\t")
+        if tab and head.strip() in known:
+            cases.append((head.strip(), rest.rstrip()))
+        else:
+            cases.append((None, ln.rstrip()))
+    return cases
+
+
 def _load_profile_file(path: Path, tasks: Sequence[str], n_layers: int,
                        n_experts: int, *, coverage: float = 0.95,
                        top_k: int = 1) -> tuple[dict, dict]:
@@ -566,6 +591,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="跳过「每台节点能不能读到 checkpoint」的预检")
     ap.add_argument("--prompt", action="append", default=None,
                     help="文本 prompt，可重复。需要 --model-dir")
+    ap.add_argument("--prompts-file", type=Path, default=None,
+                    help="一行一条 prompt 的文件。想标注真实 task 就写成 "
+                         "`mbpp\t写一个反转链表的函数` —— 制表符前是 task 名，"
+                         "用来核对在线识别对不对。`#` 开头与空行跳过。"
+                         "**--requests 比条数多时会循环**，少时只跑前几条")
+    ap.add_argument("--save-results", type=Path, default=None,
+                    help="把逐请求结果写成 JSON：时序拆解、各节点算力占比、"
+                         "识别对错、生成的文本。测完就有一份可复算的底稿，"
+                         "不用回头翻滚屏日志")
     ap.add_argument("--chat", action="store_true", help="套对话模板（指令模型必须）")
     ap.add_argument("--static", action="store_true",
                     help="静态简化模式：前段装全部专家，前后段配对离线定死。"
@@ -851,6 +885,30 @@ def main(argv: list[str] | None = None) -> int:
         log.info("[5/5] 在线服务：%d 条请求 × %d token，并发 %d（池子 %d 前段 / %s 后段）",
                  args.requests, args.tokens, args.concurrency,
                  len(coord.free_fronts), {u: len(q) for u, q in coord.free_backs.items()})
+    # 来自 --prompts-file 的测试集：[(true_task|None, 文本), ...]
+    cases: list[tuple[str | None, str]] = []
+    if args.prompts_file:
+        cases = load_cases(args.prompts_file, names)
+        if not cases:
+            log.error("%s 里一条 prompt 都没有", args.prompts_file)
+            return 2
+        blank = [i for i, (_, t) in enumerate(cases) if not t.strip()]
+        if blank:
+            log.warning("  第 %s 行的 prompt 是空的 —— 采集端的问题。"
+                        "它们会照样发出去（0 token 的请求），"
+                        "好让问题露出来而不是被悄悄跳过",
+                        ", ".join(str(i + 1) for i in blank[:10]))
+        labelled = sum(1 for u, _ in cases if u)
+        log.info("测试集 %s：%d 条，其中 %d 条带 task 标注%s",
+                 args.prompts_file, len(cases), labelled,
+                 "" if labelled == len(cases) else "（没标注的按轮转指派真实 task）")
+        if args.requests > len(cases):
+            log.info("  --requests %d > %d 条 —— 会循环重跑",
+                     args.requests, len(cases))
+        elif args.requests < len(cases):
+            log.info("  --requests %d < %d 条 —— 只跑前 %d 条",
+                     args.requests, len(cases), args.requests)
+
     rows, batch = [], []
 
     def drain(batch_):
@@ -883,7 +941,12 @@ def main(argv: list[str] | None = None) -> int:
 
     for i in range(args.requests):
         u = names[i % len(names)]
-        if textio and args.prompt:
+        if textio and cases:
+            true_u, txt = cases[i % len(cases)]
+            true_u = true_u or u
+            batch.append(coord.submit(f"req{i}", text=txt, true_task=true_u,
+                                      task=true_u if args.static else None))
+        elif textio and args.prompt:
             batch.append(coord.submit(f"req{i}", text=args.prompt[i % len(args.prompt)],
                                       true_task=u, task=u if args.static else None))
         else:
@@ -909,6 +972,76 @@ def main(argv: list[str] | None = None) -> int:
         log.info("配对历史（每条请求用了哪对段）：")
         for req, f, b, u in coord.pairings:
             log.info("    %-7s %s × %s  (%s)", req, f, b, u)
+    if args.save_results and rows:
+        from p2pmoe.runtime.timing import summarise_request
+
+        out = {
+            "model": setup.label,
+            "l0": int(getattr(spec, "l0", 0) or 0),
+            "backend": setup.backend,
+            "mode": "static" if args.static else "dynamic",
+            "miss_policy": args.miss_policy,
+            "coverage": args.coverage,
+            "tokens": args.tokens,
+            "concurrency": args.concurrency,
+            "requests": [],
+        }
+        for rec, p50 in rows:
+            t = summarise_request(rec, coord)
+            out["requests"].append({
+                "req": rec.req,
+                "prompt": rec.prompt,
+                "text": rec.text,
+                "stop_reason": rec.stop_reason,
+                "true_task": rec.true_task,
+                "task": rec.task,
+                # 静态模式不识别，correct 恒真没有信息量 —— 置 None 免得被当成 100%
+                "correct": None if args.static else bool(rec.correct),
+                "confidence": round(rec.conf, 4),
+                "zone": rec.zone,
+                "rebinds": rec.rebinds,
+                "front": rec.front, "back": rec.back,
+                "n_prompt": t.n_prompt, "n_generated": t.n_generated,
+                "total_ms": round(t.total_ms, 2),
+                "queue_ms": round(t.queue_ms, 2),
+                "prefill_ms": round(t.prefill_ms, 2),
+                "decode_ms": round(t.decode_ms, 2),
+                "per_token_p50_ms": round(p50, 2),
+                "compute_ms": round(t.compute_ms, 2),
+                # 反推的，不是测量值：15 台没有时钟同步，跨机时刻拼不到一条轴上
+                "network_and_overhead_ms": round(t.other_ms, 2),
+                "utilisation": round(t.utilisation, 4),
+                "token_ms": [round(x, 2) for x in t.token_ms],
+                "nodes": [{
+                    "node": n.node, "role": n.role, "segment": n.segment,
+                    "layers": n.layer_span, "n_experts": n.n_experts,
+                    "compute_ms": round(n.compute_ms, 2),
+                    "n_forward": n.n_forward, "bytes_out": n.bytes_out,
+                    "share": round(t.node_utilisation(n), 4),
+                } for n in t.nodes],
+                "missing_traces": t.missing_traces,
+            })
+        rs = out["requests"]
+        out["summary"] = {
+            "n": len(rs),
+            "total_ms_p50": round(float(np.median([r["total_ms"] for r in rs])), 2),
+            "per_token_ms_p50": round(float(np.median(
+                [r["per_token_p50_ms"] for r in rs])), 2),
+            "utilisation_mean": round(float(np.mean(
+                [r["utilisation"] for r in rs])), 4),
+            "rebinds": sum(r["rebinds"] for r in rs),
+            "accuracy": (None if args.static else round(
+                sum(bool(r["correct"]) for r in rs) / len(rs), 4)),
+            "errors": len(coord.errors),
+        }
+        args.save_results.parent.mkdir(parents=True, exist_ok=True)
+        args.save_results.write_text(
+            json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("结果已写入 %s（%d 条）—— 算力使用率均值 %.1f%%，总时延 p50 %.0fms",
+                 args.save_results, len(rs),
+                 out["summary"]["utilisation_mean"] * 100,
+                 out["summary"]["total_ms_p50"])
+
     if coord.errors:
         log.error("节点上报的错误：")
         for e in coord.errors[:5]:

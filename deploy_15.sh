@@ -10,6 +10,7 @@
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
+#   ./deploy_15.sh report     # 把 results/run.json 读成一张人能看的表
 #   ./deploy_15.sh stop
 #   ./deploy_15.sh all        # sync → check → fetch → start → serve
 #
@@ -40,6 +41,8 @@ COVERAGE=${COVERAGE:-0.70}
 TASKS=${TASKS:-mbpp=5,gsm8k=3}
 TOKENS=${TOKENS:-64}
 REQUESTS=${REQUESTS:-20}
+PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
+RESULTS=${RESULTS:-results/run.json}            # 逐请求结果落盘
 # ---------------------------------------------------------------------------
 
 PY=${PY:-python3}
@@ -246,13 +249,74 @@ cmd_serve() {
       --model-dir "$WEIGHTS" --device "$DEVICE" --ctx 2048 \
       --profile "$PROFILE" --coverage "$COVERAGE" \
       --tasks "$TASKS" --chat \
-      --tokens "$TOKENS" --requests "$REQUESTS" --concurrency 3 --once "$@"
+      --tokens "$TOKENS" --requests "$REQUESTS" --concurrency 3 \
+      ${PROMPTS:+$([ -f "$PROMPTS" ] && echo "--prompts-file $PROMPTS")} \
+      ${RESULTS:+--save-results "$RESULTS"} \
+      --once "$@"
 }
 
 cmd_measure() {
   say "5'. 服务 + 逐请求时序"
   echo "  --warmup 不是可选的：torch 首次前向含 kernel 选择，不预热量到的是冷启动"
   cmd_serve --verbose
+}
+
+# 把 --save-results 落下来的 JSON 读成一张表。测完看这个，不用翻滚屏日志。
+cmd_report() {
+  local f=${1:-$RESULTS}
+  [ -f "$f" ] || { echo "没有 $f —— 先跑 ./deploy_15.sh measure"; exit 1; }
+  $PY - "$f" <<'PYEOF'
+import json, sys, statistics as st
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+rs = d["requests"]; sm = d["summary"]
+B, R = "\033[1m", "\033[0m"
+print(f"\n{B}{d['model']}  L₀={d['l0']}  {d['mode']}  "
+      f"miss={d['miss_policy']}  cov={d['coverage']}{R}")
+print(f"{'req':<7}{'真实':<7}{'识别':<7}{'':<3}{'通道':<16}"
+      f"{'总ms':>8}{'排队':>7}{'首tok':>7}{'/tok':>7}{'算力':>7}")
+print("─" * 78)
+for r in rs:
+    mark = "" if r["correct"] is None else ("✓" if r["correct"] else "✗")
+    print(f"{r['req']:<7}{str(r['true_task']):<7}{str(r['task']):<7}{mark:<3}"
+          f"{r['front']+'×'+r['back']:<16}"
+          f"{r['total_ms']:>8.0f}{r['queue_ms']:>7.0f}{r['prefill_ms']:>7.0f}"
+          f"{r['per_token_p50_ms']:>7.1f}{r['utilisation']:>6.0%}")
+print("─" * 78)
+acc = "—" if sm["accuracy"] is None else f"{sm['accuracy']:.0%}"
+print(f"  {len(rs)} 条：总时延 p50 {sm['total_ms_p50']:.0f}ms，"
+      f"逐 token p50 {sm['per_token_ms_p50']:.1f}ms，"
+      f"算力使用率均值 {sm['utilisation_mean']:.1%}，"
+      f"识别 {acc}，换绑 {sm['rebinds']} 次")
+
+# 时延去哪了 —— 三段相加恒等于总时延，所以这张表不会骗人
+c = st.mean(r["compute_ms"] for r in rs)
+q = st.mean(r["queue_ms"] for r in rs)
+o = st.mean(r["network_and_overhead_ms"] for r in rs)
+tot = c + q + o
+print(f"\n{B}  时延构成（均值）{R}")
+for name, v in (("计算", c), ("排队", q), ("网络+协议+调度", o)):
+    bar = "█" * round(40 * v / tot) if tot else ""
+    print(f"    {name:<16}{v:>8.0f}ms  {v/tot:>5.1%}  {bar}")
+print("    ⚠ 「网络」是 总时延 − 计算 − 排队 **反推**的上界，不是测量值 ——")
+print("      15 台没有时钟同步，跨机的绝对时刻拼不到一条轴上。")
+
+# 谁在干活 —— 算力使用率低时，先看是不是某一跳独吞
+print(f"\n{B}  各节点算力占比（占总时延，均值）{R}")
+agg = {}
+for r in rs:
+    for n in r["nodes"]:
+        a = agg.setdefault(n["node"], {"share": 0.0, "seg": n["segment"],
+                                       "ly": n["layers"], "ne": n["n_experts"],
+                                       "cnt": 0})
+        a["share"] += n["share"]; a["cnt"] += 1
+for nid, a in sorted(agg.items(), key=lambda kv: -kv[1]["share"] / kv[1]["cnt"]):
+    sh = a["share"] / a["cnt"]
+    print(f"    {nid:<6}{a['seg']:<12}层 {a['ly']:<8}{a['ne']:>4} 专家"
+          f"{sh:>7.1%}  {'█' * round(60 * sh)}")
+miss = {m for r in rs for m in r["missing_traces"]}
+if miss:
+    print(f"\n  ⚠ 这些节点没上报埋点：{sorted(miss)} —— 它们的计算被算进了「网络」")
+PYEOF
 }
 
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
@@ -266,7 +330,8 @@ case "${1:-all}" in
   start)   cmd_start ;;
   serve)   cmd_serve ;;
   measure) cmd_measure ;;
+  report)  cmd_report "${2:-}" ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|stop|all}"; exit 1 ;;
+  *) echo "用法: $0 {sync|bootstrap|cmds [节点]|check|fetch|start|serve|measure|report|stop|all}"; exit 1 ;;
 esac
