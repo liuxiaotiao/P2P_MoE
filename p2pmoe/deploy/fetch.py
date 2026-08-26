@@ -503,7 +503,30 @@ def main(argv: list[str] | None = None) -> int:
             log.error("这些文件**取失败了**（不是仓库里没有）：")
             for f, why in failed:
                 log.error("    %s —— %s", f, why)
-            log.error("  重跑一次；持续失败试 HF_ENDPOINT=https://hf-mirror.com")
+            # SSL EOF / 连接被重置：小文件过得去、大文件过不去，是链路在中途
+            # 掐断，不是 HF 的问题。重试同一个地址没用 —— 换出口才有用。
+            cut = any(k in w for _, w in failed for k in
+                      ("UNEXPECTED_EOF", "ConnectionReset", "Connection reset",
+                       "EOF occurred", "timed out", "TimeoutError"))
+            ep = os.environ.get("HF_ENDPOINT")
+            if cut and not ep:
+                log.error("  这个错的形状是**链路在传输中途被掐断**："
+                          "几 KB 的文件都过了，只有 11MB 的 tokenizer.json 没过。")
+                log.error("  重试同一个地址没用，换出口：")
+                log.error("")
+                log.error("      HF_ENDPOINT=https://hf-mirror.com \\")
+                log.error("          bash ./deploy_15.sh meta")
+                log.error("")
+                log.error("  （环境变量要写在命令**前面**；"
+                          "`bash HF_ENDPOINT=... ./x.sh` 是把它当成脚本名了）")
+            elif cut and ep:
+                log.error("  %s 也掐 —— 换个镜像，或者手动取这一个文件：", ep)
+            else:
+                log.error("  重跑一次试试。")
+            log.error("  实在不行就手动弄到位 —— 就一个文件，怎么下都行：")
+            log.error("      curl -L -o %s/tokenizer.json \\", args.out)
+            log.error("          %s/tokenizer.json", src.base)
+            log.error("      # 或用已有的本地全量：--src <目录>")
 
         need = {"config.json": "控制机没它算不了模型规格",
                 "tokenizer.json": "控制机没它没法把 prompt 编成 id、把 id 解回文本"}
