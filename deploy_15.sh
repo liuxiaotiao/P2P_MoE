@@ -67,6 +67,10 @@ REQUESTS=${REQUESTS:-20}
 # 注意上游拉不动**通常不是 HF 的问题** —— 见 3a 预检失败时打印的三个常见原因。
 SRC_DIR=${SRC_DIR:-}
 SRC_URL=${SRC_URL:-}
+# 取权重用哪条传输。auto = 先用 Python 的 urllib，失败一次就整轮改用 curl。
+# 「curl 能下、Python 下不动」很常见 —— 两者用的不是同一套 TLS
+# （conda 环境自带 OpenSSL，系统 curl 用系统的）。
+TRANSPORT=${TRANSPORT:-auto}
 MODE=${MODE:-slice}                             # slice=逐张量；shard=整分片（源站不支持 Range 时）
 FETCH_TIMEOUT=${FETCH_TIMEOUT:-14400}           # 单节点下载超时（秒）
 PROMPTS=${PROMPTS:-task/cases.txt}              # 测试集：一行一条 prompt
@@ -325,7 +329,8 @@ cmd_fetch() {
   local srcstr=""
   for x in "${SRCARG[@]}"; do srcstr="$srcstr $(printf %q "$x")"; done
   probe="cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") -m p2pmoe.deploy.fetch \
---plan $(printf %q "$PLAN") --node $first --out $(printf %q "$WEIGHTS")$srcstr --dry-run"
+--plan $(printf %q "$PLAN") --node $first --out $(printf %q "$WEIGHTS")$srcstr \
+--transport $(printf %q "$TRANSPORT") --dry-run"
   out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
           "${SSH_USER:+$SSH_USER@}$firstip" "$probe" </dev/null 2>&1) && rc=0 || rc=$?
   echo "$out" | sed 's/^/    /'
@@ -361,7 +366,7 @@ cmd_fetch() {
   read -rp "  继续？[y/N] " a; [ "$a" = y ] || return 0
   $PY -m p2pmoe.deploy.launch fetch --hosts "$HOSTS" --plan "$PLAN" \
       --out "$WEIGHTS" --python "$NODE_PY" --workdir "$WORKDIR" \
-      --mode "$MODE" --timeout "$FETCH_TIMEOUT" \
+      --mode "$MODE" --timeout "$FETCH_TIMEOUT" --transport "$TRANSPORT" \
       "${SSHARG[@]}" "${SRCARG[@]}"
 }
 
@@ -608,7 +613,7 @@ cmd_meta() {
   fi
   echo "  → $WEIGHTS"
   $PY -m p2pmoe.deploy.fetch --meta-only --repo "$REPO" --out "$WEIGHTS" \
-      ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
+      --transport "$TRANSPORT" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}
 }
 
 # 上游拉不动时：先在**一台**机器上下一份全量，再让 15 台从局域网切片。

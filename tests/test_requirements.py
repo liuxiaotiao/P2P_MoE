@@ -211,7 +211,15 @@ def test_declared_packages_are_actually_used() -> None:
 
 # --------------------------------------------------------------------------- #
 # 只允许 shell 出去的模块 —— 批量运维脚本，且它是可选的
-SHELL_ALLOWED = {"p2pmoe/deploy/launch.py"}
+SHELL_ALLOWED = {
+    "p2pmoe/deploy/launch.py",      # 控制机批量起停/拉权重，ssh 是它的本职
+    # fetch 只在**取权重**时起 curl，而且只是 urllib 失败后的兜底。
+    # 这与本条边界不冲突：要挡的是「数据面靠子进程」与「节点之间要 ssh」，
+    # 而取权重是一次性的开局动作，不在数据面上，也不涉及节点之间。
+    # 代价是节点上要有 curl —— 换来的是「Python 的 TLS 下不动、curl 能下」
+    # 这种情形下部署仍然走得通（见 fetch.Source.transport）。
+    "p2pmoe/deploy/fetch.py",
+}
 SHELL_MARKS = ("subprocess", "paramiko", "pexpect", "fabric")
 
 
@@ -242,3 +250,22 @@ def test_the_data_plane_never_shells_out() -> None:
             f"那会让部署门槛从「开一个端口」变成「两两配免密」"
         )
     assert not (set(used) & {"paramiko", "fabric"}), "别引 ssh 库"
+
+
+def test_fetch_only_ever_shells_out_to_curl() -> None:
+    """给 fetch 开的口子只到 curl 为止。
+
+    「取权重可以起子进程」不等于「取权重可以随便起子进程」—— 一旦开始
+    调用别的外部命令，节点的环境要求就从「有 Python」滑向「有一整套工具链」，
+    而那正是这条边界想拦住的东西。
+    """
+    import re as _re
+
+    text = (ROOT / "p2pmoe" / "deploy" / "fetch.py").read_text(encoding="utf-8")
+    calls = _re.findall(r'subprocess\.run\(\s*(\w+)', text)
+    for var in calls:
+        # 唯一那处是 `subprocess.run(cmd, ...)`，cmd 由下面这行拼出来
+        assert var == "cmd", f"fetch.py 里有别的 subprocess.run({var}…)"
+    assert '"curl", "-sS"' in text or '["curl"' in text, "curl 的调用点变了？"
+    for other in ("wget", "aria2c", "git", "rsync", "bash", "sh -c"):
+        assert f'"{other}"' not in text, f"fetch.py 起了 {other} —— 口子只到 curl"

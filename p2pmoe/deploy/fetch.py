@@ -40,6 +40,9 @@ import logging
 import os
 import sys
 import time
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -69,17 +72,42 @@ _HDR_MAX = 200 << 20  # 文件头上限，防止畸形文件把内存吃光
 
 
 # --------------------------------------------------------------------------- #
+def _total_from_headers(text: str) -> int:
+    """从响应头里读文件总长。Content-Range 优先 —— 只有它在分段响应里也是全长。"""
+    total = 0
+    for line in text.splitlines():
+        low = line.lower()
+        if low.startswith("content-range:"):
+            tail = line.rpartition("/")[2].strip()
+            if tail.isdigit():
+                total = int(tail)
+        elif low.startswith("content-length:") and not total:
+            v = line.partition(":")[2].strip()
+            if v.isdigit():
+                total = int(v)
+    return total
+
+
 class Source:
     """权重从哪来 —— HF 仓库、任意 base URL，或本地目录。"""
 
     def __init__(self, *, repo: str | None = None, revision: str = "main",
                  base_url: str | None = None, local: str | Path | None = None,
                  token: str | None = None, endpoint: str | None = None,
-                 timeout: float = 60.0, retries: int = 5):
+                 timeout: float = 60.0, retries: int = 5,
+                 transport: str = "auto"):
         self.local = Path(local) if local else None
         self.timeout = timeout
         self.retries = max(1, retries)
         self._len: dict[str, int] = {}
+        # "urllib" | "curl" | "auto"（urllib 失败一次就永久切到 curl）
+        #
+        # 为什么要有第二条传输：curl 能下、Python 下不动，是很常见的一对症状。
+        # 两者用的**不是同一套 TLS** —— conda 环境自带 OpenSSL，系统 curl 用系统的；
+        # 版本、cipher、ALPN、代理处理都可能不同。与其查清是哪一处不同，
+        # 不如换用那个已经证明能跑的。
+        self.transport = transport
+        self._curl_ok: bool | None = None
         self.token = token or os.environ.get("HF_TOKEN")
         if self.local is None:
             if base_url:
@@ -166,7 +194,74 @@ class Source:
             else:
                 stalls = 0
 
+    def _have_curl(self) -> bool:
+        if self._curl_ok is None:
+            self._curl_ok = shutil.which("curl") is not None
+        return self._curl_ok
+
     def _get(self, name: str, lo: int, hi: int | None, *, ranged: bool):
+        if self.transport == "curl":
+            return self._get_curl(name, lo, hi, ranged=ranged)
+        try:
+            return self._get_urllib(name, lo, hi, ranged=ranged)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # RangeNotSupported 是对端行为，换传输也不会变 —— 不该触发切换
+            if isinstance(e, RangeNotSupported) or self.transport != "auto":
+                raise
+            if not self._have_curl():
+                raise
+            log.warning("urllib 取 %s 失败（%s）—— 改用 curl 重试。", name, e)
+            log.warning("  这两者用的不是同一套 TLS："
+                        "conda 环境自带 OpenSSL，系统 curl 用系统的。")
+            out = self._get_curl(name, lo, hi, ranged=ranged)
+            log.warning("  curl 成功 —— **本次运行余下的请求都走 curl**。")
+            self.transport = "curl"
+            return out
+
+    def _get_curl(self, name: str, lo: int, hi: int | None, *, ranged: bool):
+        """用 curl 取一段。`-r lo-hi` 就是 Range 头。
+
+        body 与 header 分开落盘 —— body 是二进制，混在一起没法解析；
+        而状态码是必须拿到的：206 还是 200 决定了对端有没有理会 Range。
+        """
+        if not self._have_curl():
+            raise OSError("需要 curl，但 PATH 里没有")
+        with tempfile.TemporaryDirectory() as td:
+            body, hdr = Path(td) / "b", Path(td) / "h"
+            cmd = ["curl", "-sS", "-L", "--fail-with-body",
+                   "--max-time", str(int(self.timeout)),
+                   "-D", str(hdr), "-o", str(body)]
+            if self.token:
+                cmd += ["-H", f"Authorization: Bearer {self.token}"]
+            if ranged:
+                cmd += ["-r", f"{lo}-{hi - 1}" if hi is not None else f"{lo}-"]
+            cmd.append(f"{self.base}/{name}")
+            r = subprocess.run(cmd, capture_output=True, timeout=self.timeout + 30)
+            text = hdr.read_text(errors="replace") if hdr.exists() else ""
+            # -L 之后 header 文件里有多段，最后一段才是最终响应
+            codes = [int(l.split()[1]) for l in text.splitlines()
+                     if l.startswith("HTTP/") and len(l.split()) > 1]
+            status = codes[-1] if codes else 0
+            if r.returncode != 0:
+                # **两条传输必须抛同一种异常。** 调用方靠 HTTPError.code 区分
+                # 「仓库里没有这个文件」（404，可选文件正常缺席）和「取失败了」；
+                # curl 这边抛 OSError 的话，404 会被当成硬错误，
+                # 一个可有可无的 special_tokens_map.json 就能让整轮下载失败。
+                if status >= 400:
+                    raise urllib.error.HTTPError(
+                        f"{self.base}/{name}", status,
+                        f"curl: HTTP {status}", None, None)
+                raise OSError(f"curl 退出码 {r.returncode}："
+                              f"{r.stderr.decode(errors='replace').strip()[:200]}")
+            if ranged and hi is not None and lo == 0 and status != 206:
+                raise RangeNotSupported(
+                    f"{self.base} 不支持 Range 请求（请求 {name} 的一小段，"
+                    f"对端返回 {status} 把整个文件发了回来）—— "
+                    f"改用 --mode shard，或换一个支持 Range 的源")
+            self._len[name] = self._len.get(name) or _total_from_headers(text)
+            return body.read_bytes(), status
+
+    def _get_urllib(self, name: str, lo: int, hi: int | None, *, ranged: bool):
         req = urllib.request.Request(f"{self.base}/{name}")
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
@@ -642,6 +737,11 @@ def main(argv: list[str] | None = None) -> int:
                          "读 tokenizer 编解码文本。给它 141GB 权重是浪费")
     ap.add_argument("--no-tokenizer", action="store_true",
                     help="不取 tokenizer（节点其实用不到，默认取是为了目录自洽）")
+    ap.add_argument("--transport", choices=("auto", "urllib", "curl"),
+                    default="auto",
+                    help="auto=先用 Python 的 urllib，失败一次就整轮改用 curl。"
+                         "curl 能下而 Python 下不动很常见 —— 两者用的不是同一套 "
+                         "TLS（conda 自带 OpenSSL，系统 curl 用系统的）")
     ap.add_argument("--force", action="store_true",
                     help="--meta-only 时重取已存在的文件（默认跳过）")
     ap.add_argument("--diagnose", action="store_true",
@@ -654,7 +754,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(message)s")
     src = Source(repo=args.repo, revision=args.revision, base_url=args.base_url,
-                 local=args.src, endpoint=args.endpoint)
+                 local=args.src, endpoint=args.endpoint,
+                 transport=args.transport)
     if not args.diagnose and args.out is None:
         ap.error("要给 --out")
     if not (args.meta_only or args.diagnose) and not (args.plan and args.node):
