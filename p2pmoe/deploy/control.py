@@ -887,6 +887,26 @@ def main(argv: list[str] | None = None) -> int:
                  {u: len(q) for u, q in coord.front_pools.items()})
     else:
         names = [u for u, _ in tasks_lam]
+        # 有 task 一条后段都没有的话，**现在**就说 —— 否则每条被识别成它的请求
+        # 都会排进一个永远不会有人归还的队列，300 秒后报「超时」，而日志只说
+        # 「池无空闲后段」，看起来像拥塞。
+        empty = [u for u in names if coord.back_capacity.get(u, 0) == 0]
+        if empty:
+            have = {u: n for u, n in coord.back_capacity.items() if n}
+            log.error("规划给这些 task 分到了 0 条后段：%s", empty)
+            log.error("  现有通道 %s —— 被识别成 %s 的请求会全部失败。",
+                      have or "无", "/".join(empty))
+            log.error("  规划器按内存与跳数约束分配整数条通道，配额不够时"
+                      "**会给某个 task 分到 0** —— 这是离散配平的正常结果，不是崩溃。")
+            log.error("  三条路：")
+            log.error("    · 降 --coverage（现在 %.2f）—— 每条段更小，同样的机器能建更多条",
+                      args.coverage)
+            log.error("    · 调 --tasks 的到达比 —— 现在 %s，把权重挪向拿不到通道的那个",
+                      dict(tasks_lam))
+            log.error("    · 加节点")
+            log.error("  注意覆盖率与通道数**不是单调的**（段的组成是离散的、跳数是整数），"
+                      "0.60 未必比 0.70 建得多 —— 挨个试比推理快。")
+            return 2
         log.info("[5/5] 在线服务：%d 条请求 × %d token，并发 %d（池子 %d 前段 / %s 后段）",
                  args.requests, args.tokens, args.concurrency,
                  len(coord.free_fronts), {u: len(q) for u, q in coord.free_backs.items()})

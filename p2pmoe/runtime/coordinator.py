@@ -155,6 +155,15 @@ class Coordinator:
                 sorted({p.segment for p in manifest.nodes
                         if p.role == f"back:{u}"})
             )
+        # 池的**容量**（建了几条），与「此刻空闲几条」是两回事。
+        #
+        # 分清楚它们，是因为「队列空」有两种截然不同的含义：
+        #   容量 > 0，空闲 = 0  → 都忙着，等就是了（II.5 的有界等待）
+        #   容量 = 0            → 这个 task 压根没有通道，**等到超时也不会有**
+        # 混为一谈的症状是：请求排进队列，300 秒后报「超时」，而事件日志只说
+        # 「池无空闲后段」—— 看起来像拥塞，其实是规划阶段就没给它建通道。
+        self.back_capacity: dict[str, int] = {
+            u: len(q) for u, q in self.free_backs.items()}
 
         if self.static:
             # 前段按 task 分池 —— 静态模式下一条前段只服务一个 task
@@ -421,6 +430,18 @@ class Coordinator:
         self._bind(rec, target, rebind=False)
 
     def _bind(self, rec: RequestRecord, task: str, *, rebind: bool) -> None:
+        # 容量为 0 = 规划阶段就没给这个 task 建后段。排队没有意义 ——
+        # 队列里没有任何东西会被归还，等的是一个永远不会到的事件。
+        # 立刻失败，并把原因说清楚，比让它在 300 秒后报「超时」诚实得多。
+        if self.back_capacity.get(task, 0) == 0:
+            have = {u: n for u, n in self.back_capacity.items() if n}
+            rec.log(f"✗ {task} 池**一条后段都没有**（容量 0）—— 不是拥塞，是规划"
+                    f"阶段没给它建通道。现有 {have or '无'}")
+            self._fail(rec, f"task {task} 没有后段通道（容量 0）。"
+                            f"现有通道 {have or '无'}。"
+                            f"降低 --coverage 让每条段更小、或增加节点，"
+                            f"让规划器能给 {task} 分到配额")
+            return
         with self._lock:
             q = self.free_backs.get(task)
             if q:
@@ -430,9 +451,20 @@ class Coordinator:
                 depth = len(self._await_back[task])
                 b = None
         if b is None:
-            rec.log(f"{task} 池无空闲后段，排队（队深 {depth}）—— 有界等待（II.5）")
+            rec.log(f"{task} 池 {self.back_capacity[task]} 条全忙，排队"
+                    f"（队深 {depth}）—— 有界等待（II.5）")
             return
         self._attach_back(rec, task, b, rebind=rebind)
+
+    def _fail(self, rec: RequestRecord, why: str) -> None:
+        """把请求判死并唤醒等它的人。**不走 `_finish`** —— 那条路要归还通道，
+        而这条请求从来没拿到过通道，归还会把池子搞乱。"""
+        if rec.finished:
+            return
+        rec.finished = True
+        rec.stop_reason = "no_channel"
+        self.errors.append(f"{rec.req}: {why}")
+        rec.done.set()
 
     def _attach_back(self, rec: RequestRecord, task: str, b: str, *, rebind: bool) -> None:
         old, rec.back = rec.back, b

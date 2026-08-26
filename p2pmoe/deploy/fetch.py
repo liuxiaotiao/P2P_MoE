@@ -347,11 +347,25 @@ def fetch(src: Source, keys: Iterable[str], out_dir: str | Path, *,
 
 # --------------------------------------------------------------------------- #
 def keys_for_node(manifest: DeploymentManifest, node: str, *,
-                  tie_word_embeddings: bool = False) -> set[str]:
-    """清单里这台机器要哪些 key —— 与节点加载时用的是**同一个函数**。
+                  config: dict | None = None,
+                  tie_word_embeddings: bool | None = None) -> set[str]:
+    """清单里这台机器要哪些 key —— 与节点加载时**按同一套规则**分派。
 
-    同一个函数很重要：下载和加载对「要哪些 key」的理解必须一致，
-    否则会出现「下了却加载不到」或「加载时才发现少文件」。
+    下载侧和加载侧对「要哪些 key」的理解必须一致，否则症状是
+    「下完了，加载时报缺 N 个 key」—— 而那时 141GB 已经下完了。
+
+    分派按 checkpoint 自报的架构走，与 `NodeServer._build_torch` 里那段
+    逐字同源。**不按「有没有某个字段」去猜** —— 猜错的代价是下错一整套权重。
+
+    Qwen3-Next 与 Qwen3-MoE 的 key 集合差得很远，不是能糊弄过去的小差异：
+
+    * 逐层不同 —— 36 层 Gated DeltaNet 用 `linear_attn.*`，12 层全注意力才有
+      `self_attn.*`。拿 MoE 的方案去要，前者的 key 在 checkpoint 里根本不存在。
+    * **共享专家** `mlp.shared_expert.*` —— 每个 token 都激活，不参与驻留集裁剪。
+      MoE 的方案里没有它，漏了不会报错，只会让后段每一层都少加一路输出。
+
+    `config` 就是 checkpoint 的 `config.json`。不给的话退回 Qwen3-MoE 方案 ——
+    那是这个函数原来的行为，保留给只有清单、拿不到 config 的调用方。
     """
     p = manifest.plan_for(node)
     if p is None:
@@ -362,6 +376,20 @@ def keys_for_node(manifest: DeploymentManifest, node: str, *,
         with_embed=(p.role == "front" and p.is_head),
         with_lm_head=(p.role.startswith("back:") and p.is_tail),
     )
+    cfg = config or {}
+    if tie_word_embeddings is None:
+        tie_word_embeddings = bool(cfg.get("tie_word_embeddings"))
+
+    arch = str(cfg.get("model_type", "")).lower()
+    archs = [str(a).lower() for a in cfg.get("architectures", [])]
+    if arch == "qwen3_next" or any("qwen3next" in a for a in archs):
+        from p2pmoe.runtime.qwen3_next import NextModelConfig
+        from p2pmoe.runtime.weights import qwen3_next_keys
+
+        mcfg = NextModelConfig.from_hf(cfg)
+        return qwen3_next_keys(plan, layer_types=list(mcfg.layer_types),
+                               shared_expert=mcfg.shared_intermediate > 0,
+                               tie_word_embeddings=mcfg.tie_word_embeddings)
     return qwen_moe_keys(plan, tie_word_embeddings=tie_word_embeddings)
 
 
@@ -398,12 +426,12 @@ def main(argv: list[str] | None = None) -> int:
     man = DeploymentManifest.from_json(args.plan.read_text(encoding="utf-8"))
 
     cfg = src.read_json("config.json")
-    keys = keys_for_node(man, args.node,
-                         tie_word_embeddings=bool(cfg.get("tie_word_embeddings")))
+    keys = keys_for_node(man, args.node, config=cfg)
     p = man.plan_for(args.node)
-    log.info("节点 %s：%s，层 %d–%d，%d 个专家",
+    arch = str(cfg.get("model_type", "?"))
+    log.info("节点 %s：%s，层 %d–%d，%d 个专家（架构 %s，%d 个张量）",
              args.node, p.role, p.layer_range[0], p.layer_range[1],
-             sum(len(l.experts) for l in p.layers))
+             sum(len(l.experts) for l in p.layers), arch, len(keys))
     log.info("来源 %s", src)
 
     t0 = time.perf_counter()
