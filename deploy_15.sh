@@ -10,6 +10,7 @@
 #   ./deploy_15.sh meta       # 控制机取 config+tokenizer（10MB，不含权重）
 #   ./deploy_15.sh diag       # 源站诊断：大文件和小文件是不是两个域名
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
+#   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
@@ -717,6 +718,73 @@ cmd_diag() {
       </dev/null 2>&1 | sed 's/^/  /' || echo "  （ssh 不通，上机自己跑）"
 }
 
+# 逐台核对：清单要的每个 key，本机的分片里是不是都在。
+#
+# `check` 里那个预检很便宜（目录在不在、依赖装没装），**不查 key 齐不齐** ——
+# 而缺 key 要到 measure 装载模型的那一刻才炸，那时探测与建链已经白跑了几分钟。
+# 这里只读 safetensors 的文件头，几秒钟就能回答，代价与收益完全不成比例。
+#
+# 最常见的触发场景：改了 COVERAGE 之后没重跑 fetch —— 驻留集变了，
+# 权重还是旧的那一份。
+cmd_verify() {
+  need "$HOSTS"; need "$PLAN"
+  say "V. 逐台核对权重完整性（只读文件头）"
+  local only=${1:-} d; d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  local ids=()
+  while read -r id ip; do
+    [ -n "$only" ] && [ "$id" != "$only" ] && continue
+    ids+=("$id:$ip")
+    ( ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" \
+        "cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") - \
+$(printf %q "$PLAN") $(printf %q "$id") $(printf %q "$WEIGHTS")" \
+        <<'PYEOF' > "$d/$id.out" 2>&1
+import json, sys
+from pathlib import Path
+sys.path.insert(0, ".")
+from p2pmoe.deploy.fetch import keys_for_node
+from p2pmoe.planner.manifest import DeploymentManifest
+from p2pmoe.runtime.weights import WeightIndex
+
+plan, node, wdir = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.loads((Path(wdir) / "config.json").read_text(encoding="utf-8"))
+man = DeploymentManifest.from_json(Path(plan).read_text(encoding="utf-8"))
+want = keys_for_node(man, node, config=cfg)
+have = set(WeightIndex(wdir).weight_map)
+miss = want - have
+gb = sum(f.stat().st_size for f in Path(wdir).glob("*.safetensors")) / 1e9
+if miss:
+    print(f"MISS {len(miss)}/{len(want)} {gb:.1f}GB {sorted(miss)[0]}")
+    sys.exit(1)
+print(f"OK {len(want)} {gb:.1f}GB")
+PYEOF
+      echo $? > "$d/$id.rc" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+
+  local ok=0 bad=0
+  for e in "${ids[@]}"; do
+    local id=${e%%:*} ip=${e#*:} out
+    out=$(head -3 "$d/$id.out" 2>/dev/null)
+    case "$out" in
+      OK\ *)   set -- $out; printf '  ✓ %-5s %s 个张量  %s\n' "$id" "$2" "$3"; ok=$((ok+1)) ;;
+      MISS\ *) set -- $out
+               printf '  ✗ %-5s 缺 %s  已有 %s  首个: %s\n' "$id" "$2" "$3" "$4"
+               bad=$((bad+1)) ;;
+      *)       printf '  ? %-5s %s\n' "$id" "$(echo "$out" | head -1)"; bad=$((bad+1)) ;;
+    esac
+  done
+  echo
+  if [ "$bad" = 0 ]; then
+    echo "  $ok/$ok 台的权重与清单一致 —— 可以 start 了。"
+    return 0
+  fi
+  echo "  $bad 台对不上。最常见的原因：**改了 COVERAGE 之后没重跑 fetch** ——"
+  echo "  驻留集变了，权重还是旧的那份。重跑：bash ./deploy_15.sh fetch"
+  echo "  （fetch 会跳过已有的分片，只补缺的）"
+  return 1
+}
+
 cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
 
 # serve / measure 后面多写的参数**原样透传给 control.py**，例如
@@ -733,6 +801,7 @@ case "$action" in
   fetch)   cmd_fetch ;;
   meta)    cmd_meta ;;
   diag)    cmd_diag ;;
+  verify)  cmd_verify "${1:-}" ;;
   serve-weights) cmd_serve_weights "${1:-}" ;;
   start)   cmd_start ;;
   serve)   cmd_serve "$@" ;;
@@ -742,6 +811,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

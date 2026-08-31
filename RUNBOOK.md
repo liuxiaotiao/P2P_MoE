@@ -136,8 +136,9 @@ torch 装在 conda 环境里的话，**裸 `python3` 是看不见它的**。而 
 ```bash
 ./deploy_15.sh sync      # rsync 代码到 15 台 + 各自 pip install
 ./deploy_15.sh check     # ssh 可达 → agent 在线 → 两两可达探测
-./deploy_15.sh fetch     # 先 dry-run 给你看会下多少，按 y 才真拉
-./deploy_15.sh start     # 起 15 个 agent
+./deploy_15.sh fetch     # 先用一台试通源站，再 15 台一起下（每 30s 报进度）
+./deploy_15.sh verify    # 逐台核对权重齐不齐（只读文件头，几秒）
+./deploy_15.sh start     # 起 15 个 agent（自己验活）
 ./deploy_15.sh measure   # 建链 + 打请求 + 逐请求时序
 ./deploy_15.sh report    # 出表
 ```
@@ -446,6 +447,10 @@ done
 **`xxx/config.json 不存在`** —— 控制机也要这个目录，但只要里面的
 `config.json` 与 tokenizer（约 10MB），**不要权重**。跑 `./deploy_15.sh meta`。
 
+**`measure` 报「checkpoint 缺 N 个 key」** —— 改了 `COVERAGE` 之后没重跑 `fetch`：
+驻留集变了，权重还是旧的那份。`./deploy_15.sh verify` 能在 start 之前几秒钟就发现，
+不用等到装载模型那一刻。`fetch` 会跳过已有的分片，只补缺的。
+
 **某个 task 分到 0 条后段** —— 规划器按内存与跳数约束分**整数条**通道，配额不够时
 会给某个 task 分到 0。这是离散配平的正常结果。`serve` 现在会在开跑前拦住并点名。
 降 `--coverage`、调 `--tasks` 的到达比、或加节点。注意覆盖率与通道数**不是单调的**
@@ -500,6 +505,8 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 | `./deploy_15.sh fetch` | 控制机 | 各节点只拉自己那份权重 |
 | `./deploy_15.sh meta` | 控制机 | 取 config + tokenizer（10MB，不含权重） |
 | `./deploy_15.sh serve-weights <目录>` | 有全量的那台 | 起一个支持 Range 的局域网权重源 |
+| `./deploy_15.sh verify [节点]` | 控制机 | 核对本机分片里有没有清单要的每个 key |
+| `./deploy_15.sh diag` | 控制机 | 源站诊断：大文件与小文件是不是两个域名 |
 | `./deploy_15.sh start` | 控制机 | 起 15 个 agent |
 | `./deploy_15.sh serve` | 控制机 | 建链 + 打请求 |
 | `./deploy_15.sh measure` | 控制机 | 同上 + 预热 + 逐请求时序 |
@@ -515,6 +522,7 @@ HOSTS=task/hosts.txt          PLAN=task/plan_deploy.json
 PROFILE=task/profile_real.json  REPO=Qwen/Qwen3-Next-80B-A3B-Instruct
 WEIGHTS=$WORKDIR/weights        WORKDIR=/home/ubuntu/P2P_MoE
 SRC_DIR=  SRC_URL=  MODE=slice  FETCH_TIMEOUT=14400  WSRC_PORT=9400
+TRANSPORT=auto  PROGRESS_EVERY=30
 NODE_PY=<节点上带 torch 的解释器>  CONDA_ENV=moe
 ADVERTISE=<必填>               DEVICE=cuda:0
 COVERAGE=0.70                  TASKS=mbpp=5,gsm8k=3
