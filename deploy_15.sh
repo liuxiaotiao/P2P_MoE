@@ -12,6 +12,7 @@
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
+#   ./deploy_15.sh disk       # 逐台磁盘：份额 vs 实占 vs 幽灵，一张表
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
@@ -881,6 +882,105 @@ EOS
   return 0
 }
 
+# 逐台磁盘占用，横着摆一张表。
+#
+# 单看一台的 df 说明不了什么 —— 15 台的**差异**才有信息量：清单里每台的份额
+# 本来就不同（0.9GB 到 22.4GB），所以占用不同是正常的。真正要判断的是
+# 「差异是不是还对得上份额」。
+#
+# 所以这张表把三个数摆在一起：
+#   份额   清单说这台该有多少权重
+#   实占   目录里现在有多少
+#   幽灵   已删除但仍被进程开着的字节 —— 目录里看不见，空间却没还
+# 目录空了而幽灵约等于份额，答案就写在脸上。
+cmd_disk() {
+  need "$HOSTS"; need "$PLAN"
+  say "D. 逐台磁盘"
+  local d; d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  local ids=()
+  while read -r id ip; do
+    ids+=("$id:$ip")
+    ( ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" "bash -s" <<EOS > "$d/$id.out" 2>&1
+W=$(printf %q "$WEIGHTS")
+# 目录里现在有多少（字节）
+if [ -d "\$W" ]; then CUR=\$(du -sb "\$W" 2>/dev/null | cut -f1); else CUR=0; fi
+# 已删除但仍被打开的字节 —— stat -L 跟着 /proc/pid/fd 的链接能拿到已删 inode 的大小
+GHOST=0
+for pid in \$(pgrep -f 'p2pmoe' 2>/dev/null); do
+  for fd in /proc/\$pid/fd/*; do
+    t=\$(readlink "\$fd" 2>/dev/null) || continue
+    case "\$t" in *"(deleted)"*)
+      sz=\$(stat -L -c %s "\$fd" 2>/dev/null) && GHOST=\$((GHOST + sz));;
+    esac
+  done
+done
+read -r TOT USED AVAIL <<<\$(df -B1 --output=size,used,avail "\$(dirname "\$W")" 2>/dev/null | tail -1)
+echo "\${CUR:-0} \${GHOST:-0} \${TOT:-0} \${USED:-0} \${AVAIL:-0}"
+EOS
+      echo $? > "$d/$id.rc" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+
+  $PY - "$PLAN" "$d" "${ids[@]}" <<'PYEOF'
+import sys
+from pathlib import Path
+import json
+
+plan, d = sys.argv[1], Path(sys.argv[2])
+want = {n["node"]: n.get("weight_gb", 0.0)
+        for n in json.load(open(plan, encoding="utf-8"))["nodes"]}
+
+G = 1e9
+print(f"  {'节点':<6}{'份额':>8}{'实占':>9}{'幽灵':>9}{'已用':>9}{'可用':>9}  诊断")
+print("  " + "─" * 74)
+tot_cur = tot_ghost = 0.0
+rows = []
+for e in sys.argv[3:]:
+    nid, ip = e.split(":", 1)
+    rc = (d / f"{nid}.rc").read_text().strip() if (d / f"{nid}.rc").exists() else "1"
+    if rc != "0":
+        print(f"  {nid:<6}  ssh 连不上"); continue
+    parts = (d / f"{nid}.out").read_text().split()
+    try:
+        cur, ghost, _tot, used, avail = (int(x) for x in parts[-5:])
+    except (ValueError, IndexError):
+        print(f"  {nid:<6}  读不出（{' '.join(parts)[:50]}）"); continue
+    w = want.get(nid, 0.0)
+    tot_cur += cur / G
+    tot_ghost += ghost / G
+
+    # 诊断：目录里没有、幽灵约等于份额 → 被删但仍被占着
+    if cur / G < w * 0.5 and ghost / G > w * 0.5:
+        note = "⚠ 被删但进程还占着 —— stop force 才能还回来"
+    elif cur / G < w * 0.5:
+        note = "✗ 权重不在这儿（没下 / 下到别处了）"
+    elif ghost / G > 1:
+        note = f"权重在，另有 {ghost/G:.1f}GB 幽灵"
+    else:
+        note = "✓"
+    rows.append((nid, w, cur / G, ghost / G, used / G, avail / G, note))
+
+for nid, w, cur, ghost, used, avail, note in rows:
+    print(f"  {nid:<6}{w:>7.1f}G{cur:>8.1f}G{ghost:>8.1f}G{used:>8.0f}G{avail:>8.0f}G  {note}")
+print("  " + "─" * 74)
+print(f"  {'合计':<6}{sum(want.values()):>7.1f}G{tot_cur:>8.1f}G{tot_ghost:>8.1f}G")
+print()
+if tot_ghost > 1:
+    print("  「幽灵」= 文件已删除，但进程还开着它的 fd。Linux 不会立刻回收 ——")
+    print("  目录里看不见，磁盘和内存却还占着，要等持有进程退出。")
+    print("      bash ./deploy_15.sh stop force     # 进程退出，空间才真回来")
+    print("      bash ./deploy_15.sh disk           # 确认幽灵归零")
+    print("      bash ./deploy_15.sh fetch          # 重下")
+elif tot_cur < sum(want.values()) * 0.9:
+    print("  实占明显小于份额 —— 要么没下完，要么下到了别的目录。")
+    print("      bash ./deploy_15.sh whereis        # 找找在哪")
+else:
+    print("  各台实占与份额相符。占用不同是正常的 —— 清单里每台的份额本就不同")
+    print("  （最大 22.4GB，最小 0.9GB），那是按层区间与驻留集算出来的。")
+PYEOF
+}
+
 cmd_stop() {
   say "停 agent"
   local extra=()
@@ -904,6 +1004,7 @@ case "$action" in
   diag)    cmd_diag ;;
   verify)  cmd_verify "${1:-}" ;;
   whereis) cmd_whereis "${1:-}" ;;
+  disk)    cmd_disk ;;
   serve-weights) cmd_serve_weights "${1:-}" ;;
   start)   cmd_start ;;
   serve)   cmd_serve "$@" ;;
@@ -913,6 +1014,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop "${1:-}" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|whereis|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|whereis|disk|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac
