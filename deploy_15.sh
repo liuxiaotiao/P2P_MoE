@@ -11,6 +11,7 @@
 #   ./deploy_15.sh diag       # 源站诊断：大文件和小文件是不是两个域名
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
+#   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
 #   ./deploy_15.sh start      # 起 agent
 #   ./deploy_15.sh serve      # 建链 + 打请求（动态模式：随机到达、在线识别）
 #   ./deploy_15.sh measure    # 同上，外加逐请求时序与算力使用率
@@ -798,6 +799,88 @@ PYEOF
 # 为什么要有 force：按命令行匹配只认得出自己起的那些。上一轮如果是手工起的、
 # 参数顺序不同、或者进程卡在退出中途，端口就还占着 —— 下一轮 start 报
 # Address already in use，而 stop 却说「成功」。
+# 权重到底在哪、内存被谁占着。
+#
+# 典型的一对症状：`ls $WEIGHTS` 空空如也，内存/磁盘却还满着。
+# Linux 下 unlink 一个**正在被 mmap 的文件**，空间不会立刻释放 ——
+# 目录里看不见了，但持有 fd 的进程还占着它。文件真正消失要等那个进程退出。
+#
+# 最常见的来路：某次 `sync` 用的是加排除项之前的脚本，`rsync --delete`
+# 把 weights/ 当成「源端没有」删掉了，而 agent 正开着那些分片。
+cmd_whereis() {
+  need "$HOSTS"
+  say "W. 权重在哪 / 内存被谁占着"
+  local only=${1:-} d; d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  local ids=()
+  while read -r id ip; do
+    [ -n "$only" ] && [ "$id" != "$only" ] && continue
+    ids+=("$id:$ip")
+    ( ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" "bash -s" <<EOS > "$d/$id.out" 2>&1
+W=$(printf %q "$WEIGHTS")
+
+echo "配置路径 \$W"
+if [ -d "\$W" ]; then
+  N=\$(ls "\$W"/*.safetensors 2>/dev/null | wc -l)
+  echo "  在，\$N 个分片，\$(du -sh "\$W" 2>/dev/null | cut -f1)"
+else
+  echo "  ✗ 目录不存在"
+fi
+
+echo "别处的 safetensors（找 \$HOME 与 /data，深度 4）"
+find "\$HOME" /data -maxdepth 4 -name '*.safetensors' -printf '%h\n' 2>/dev/null \
+  | sort | uniq -c | sort -rn | head -5 | sed 's/^/  /' || echo "  没找到"
+
+echo "agent 进程"
+for pid in \$(pgrep -f 'p2pmoe.deploy.agent' 2>/dev/null); do
+  case "\$(ps -o comm= -p \$pid 2>/dev/null)" in python*|Python*) ;; *) continue;; esac
+  echo "  pid \$pid  RSS \$(awk '/VmRSS/{printf "%.1f GB", \$2/1048576}' /proc/\$pid/status 2>/dev/null)"
+  # **重点**：已被删除但仍被打开的文件 —— 它们还占着空间
+  DEL=\$(ls -l /proc/\$pid/fd 2>/dev/null | grep -c '(deleted)')
+  MAPDEL=\$(grep -c '(deleted)' /proc/\$pid/maps 2>/dev/null || echo 0)
+  echo "    已删除但仍打开: fd \$DEL 个, 内存映射 \$MAPDEL 段"
+  if [ "\$MAPDEL" != 0 ]; then
+    grep '(deleted)' /proc/\$pid/maps 2>/dev/null \
+      | awk '{print \$(NF-1)}' | sort -u | head -3 | sed 's/^/      /'
+  fi
+done
+[ -z "\$(pgrep -f 'p2pmoe.deploy.agent' 2>/dev/null)" ] && echo "  （没有 agent 在跑）"
+
+echo "磁盘"
+df -h "\$(dirname "\$W")" 2>/dev/null | tail -1 | awk '{print "  "\$2" 总 / "\$3" 用 / "\$4" 可用"}'
+echo "内存"
+free -g 2>/dev/null | awk '/Mem:/{print "  "\$2" GB 总 / "\$3" 用 / "\$7" 可用"}'
+EOS
+      echo $? > "$d/$id.rc" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+
+  local ghost=0
+  for e in "${ids[@]}"; do
+    local id=${e%%:*} ip=${e#*:}
+    printf '\n\033[1m── %s @ %s\033[0m\n' "$id" "$ip"
+    if [ "$(cat "$d/$id.rc" 2>/dev/null)" != 0 ]; then
+      echo "   ✗ ssh 连不上"; continue
+    fi
+    sed 's/^/   /' "$d/$id.out"
+    grep -q '已删除但仍打开: fd 0 个, 内存映射 0' "$d/$id.out" || \
+      grep -q '已删除但仍打开' "$d/$id.out" && \
+      grep -q '内存映射 [1-9]' "$d/$id.out" && ghost=$((ghost+1))
+  done
+
+  echo
+  say "怎么读"
+  echo "  · 目录不存在 / 分片为 0，而「已删除但仍打开」不是 0"
+  echo "    → 文件被删了，但 agent 还开着它们。空间要等进程退出才回来。"
+  echo "    → 处置：bash ./deploy_15.sh stop force   然后重新 fetch"
+  echo "  · 「别处的 safetensors」指向另一个目录"
+  echo "    → 上一轮 fetch 的 --out 与现在的 WEIGHTS 不一致。改 WEIGHTS 指过去，"
+  echo "      或重新 fetch（15 台路径必须一致）。"
+  echo "  · 目录在、分片齐、RSS 大 —— 那是正常的：模型装载后就该占着内存。"
+  [ "$ghost" -gt 0 ] && echo && echo "  ⚠ $ghost 台有「已删除但仍打开」的映射。"
+  return 0
+}
+
 cmd_stop() {
   say "停 agent"
   local extra=()
@@ -820,6 +903,7 @@ case "$action" in
   meta)    cmd_meta ;;
   diag)    cmd_diag ;;
   verify)  cmd_verify "${1:-}" ;;
+  whereis) cmd_whereis "${1:-}" ;;
   serve-weights) cmd_serve_weights "${1:-}" ;;
   start)   cmd_start ;;
   serve)   cmd_serve "$@" ;;
@@ -829,6 +913,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop "${1:-}" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|whereis|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

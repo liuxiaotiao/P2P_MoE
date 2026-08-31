@@ -456,6 +456,13 @@ done
 降 `--coverage`、调 `--tasks` 的到达比、或加节点。注意覆盖率与通道数**不是单调的**
 （段的组成是离散的、跳数是整数），0.60 未必比 0.70 建得多 —— 挨个试比推理快。
 
+**权重目录空了，内存却还满着** —— 文件被删了，但 agent 还开着它们的 fd。
+Linux 下 unlink 一个正在被 mmap 的文件，空间不会立刻释放，要等持有进程退出。
+`./deploy_15.sh whereis` 会把「已删除但仍打开」的映射连同路径一起列出来。
+
+最常见的来路：某次 `sync` 用的是**加排除项之前**的脚本，`rsync --delete` 把
+`weights/` 当成「源端没有」删掉了。处置：`stop force` 之后重新 `fetch`。
+
 **`Address already in use`（agent 起不来）** —— 上一轮的进程还占着 9101。
 `start` 现在会自己先清一次；手工清用 `./deploy_15.sh stop force`，它会**先打印
 占用者是谁**再杀（那台上可能跑着别人的东西）。
@@ -510,6 +517,7 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 | `./deploy_15.sh meta` | 控制机 | 取 config + tokenizer（10MB，不含权重） |
 | `./deploy_15.sh serve-weights <目录>` | 有全量的那台 | 起一个支持 Range 的局域网权重源 |
 | `./deploy_15.sh verify [节点]` | 控制机 | 核对本机分片里有没有清单要的每个 key |
+| `./deploy_15.sh whereis [节点]` | 控制机 | 权重在哪、内存被谁占着 |
 | `./deploy_15.sh diag` | 控制机 | 源站诊断：大文件与小文件是不是两个域名 |
 | `./deploy_15.sh start` | 控制机 | 起 15 个 agent |
 | `./deploy_15.sh serve` | 控制机 | 建链 + 打请求 |
