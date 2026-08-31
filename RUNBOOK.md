@@ -456,6 +456,10 @@ done
 降 `--coverage`、调 `--tasks` 的到达比、或加节点。注意覆盖率与通道数**不是单调的**
 （段的组成是离散的、跳数是整数），0.60 未必比 0.70 建得多 —— 挨个试比推理快。
 
+**`Address already in use`（agent 起不来）** —— 上一轮的进程还占着 9101。
+`start` 现在会自己先清一次；手工清用 `./deploy_15.sh stop force`，它会**先打印
+占用者是谁**再杀（那台上可能跑着别人的东西）。
+
 **`✗ 必须设 ADVERTISE`** —— 见 §2。
 
 **`sync` 报「同一个目录」** —— 控制机自己就是这台，而且就坐在 `$WORKDIR` 里。跳过 rsync 是对的（对着自己跑 `--delete` 会咬人），依赖照装。
@@ -513,7 +517,7 @@ python3 -m p2pmoe.deploy.relay --bind 0.0.0.0:9200
 | `./deploy_15.sh report [文件]` | 控制机 | 把结果 JSON 读成表 |
 | `./deploy_15.sh logs [节点]` | 控制机 | 拉 agent 日志 |
 | `./deploy_15.sh doctor [节点]` | 控制机 | 逐台体检：代码/torch/权重/端口/日志 |
-| `./deploy_15.sh stop` | 控制机 | 停 15 个 agent |
+| `./deploy_15.sh stop [force]` | 控制机 | 停 15 个 agent；`force` 连占着 9101 的进程一起清 |
 
 配置项（环境变量覆盖，或改脚本顶部）：
 

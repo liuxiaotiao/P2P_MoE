@@ -17,7 +17,7 @@
 #   ./deploy_15.sh report     # 把 results/run.json 读成一张人能看的表
 #   ./deploy_15.sh logs [节点] # 拉 agent 日志
 #   ./deploy_15.sh doctor     # 逐台体检：代码/torch/权重/端口/日志
-#   ./deploy_15.sh stop
+#   ./deploy_15.sh stop [force]  # force 连占着端口的进程一起清
 #   ./deploy_15.sh all        # sync → check → fetch → start → serve
 #
 # 全部命令都在**控制机这一台**上跑。控制机可以是这 15 台里的任意一台，也可以是
@@ -428,6 +428,11 @@ cmd_fetch() {
 cmd_start() {
   say "4. 起 agent"
   _require_node_py || return 1
+  # 起之前先把上一轮的残留清掉 —— 否则 Address already in use，
+  # 而那个错要翻日志才看得见（start 只报 fork 成功）。
+  echo "  先清上一轮的残留…"
+  $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}" --by-port \
+    2>&1 | grep -vE "^\\s*$|空闲" | sed 's/^/    /' || true
   $PY -m p2pmoe.deploy.launch start --hosts "$HOSTS" --workdir "$WORKDIR" \
       --python "$NODE_PY" "${SSHARG[@]}"
   sleep 5
@@ -785,7 +790,20 @@ PYEOF
   return 1
 }
 
-cmd_stop() { say "停"; $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}"; }
+# 停 agent。
+#
+#   ./deploy_15.sh stop        # 按命令行匹配，只杀本框架的 agent
+#   ./deploy_15.sh stop force  # 连**占着 9101 的进程**一起清
+#
+# 为什么要有 force：按命令行匹配只认得出自己起的那些。上一轮如果是手工起的、
+# 参数顺序不同、或者进程卡在退出中途，端口就还占着 —— 下一轮 start 报
+# Address already in use，而 stop 却说「成功」。
+cmd_stop() {
+  say "停 agent"
+  local extra=()
+  [ "${1:-}" = force ] && { extra+=(--by-port); echo "  force：连占着 9101 的进程一起清（会先打印是谁）"; }
+  $PY -m p2pmoe.deploy.launch stop --hosts "$HOSTS" "${SSHARG[@]}" "${extra[@]}"
+}
 
 # serve / measure 后面多写的参数**原样透传给 control.py**，例如
 #     ./deploy_15.sh measure --coverage 0.60 --miss-policy drop_noscale
@@ -809,7 +827,7 @@ case "$action" in
   report)  cmd_report "${1:-}" ;;
   logs)    cmd_logs "${1:-}" ;;
   doctor)  cmd_doctor "${1:-}" ;;
-  stop)    cmd_stop ;;
+  stop)    cmd_stop "${1:-}" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
   *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;

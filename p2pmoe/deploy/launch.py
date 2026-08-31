@@ -222,9 +222,48 @@ def _warn_default_workdir(args) -> None:
     print("    加上 --workdir /path/to/p2p-framework（deploy_15.sh 用 $WORKDIR）")
 
 
-def _stop_cmd(h: Host) -> str:
-    # 精确匹配 --id，避免误杀同机上别的 agent
-    return f"pkill -f {shlex.quote(f'p2pmoe.deploy.agent --id {h.node_id} ')} || true"
+def _stop_cmd(h: Host, *, by_port: bool = False) -> str:
+    """停掉这台上的 agent。
+
+    默认按 `--id` 精确匹配命令行 —— 同机上可能还跑着别人的东西，宁可漏杀不误杀。
+
+    但**漏杀的代价是下一轮起不来**：端口还被占着，`start` 报
+    `Address already in use`，而 `pkill -f` 只认命令行模式 —— 上一轮如果是手工
+    起的、或者参数顺序不同，模式就对不上。`by_port` 补的是这个洞：直接找谁在听
+    这个端口。它更狠，所以要显式要求，而且会先把杀掉的进程打出来。
+    """
+    pat = shlex.quote(f"p2pmoe.deploy.agent --id {h.node_id}")
+    # **不能直接用 `pkill -f`。**
+    #
+    # ssh 远端执行的是 `bash -c '<整条命令>'`，而这条命令里就写着那个模式 ——
+    # 于是 `pkill -f` 第一个匹配到的是**执行它的这个 shell 自己**，把自己杀掉，
+    # 后面的清理一句都跑不到。症状是 stop 悄无声息地什么也没做，
+    # 下一轮 start 照样 Address already in use。
+    #
+    # 所以先 pgrep 拿 pid，再**按 comm 只留 python 进程**：agent 是 python，
+    # 包裹它的 shell 是 bash，这样一刀切干净，不用去猜 $$ / $PPID 有几层。
+    base = (f"for p in $(pgrep -f {pat} 2>/dev/null); do "
+            f'case "$(ps -o comm= -p $p 2>/dev/null)" in '
+            f"python*|Python*) kill $p 2>/dev/null;; esac; done; ")
+    if not by_port:
+        return base + "true"
+    # 三条查法轮着来 —— 没有哪一条到处都有：
+    #   ss     容器镜像里常常没装（本仓库的开发容器就没有）
+    #   fuser  psmisc 包，最小化镜像里可能没有
+    #   lsof   有些发行版默认不装
+    # `ss -p` 还有个限制：只对自己的进程（或 root）给得出 pid。
+    return base + (
+        f"P=$(ss -lntpH 'sport = :{h.port}' 2>/dev/null "
+        f"| grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); "
+        f'[ -z "$P" ] && P=$(fuser {h.port}/tcp 2>/dev/null); '
+        f'[ -z "$P" ] && P=$(lsof -ti tcp:{h.port} -sTCP:LISTEN 2>/dev/null); '
+        f'if [ -n "$P" ]; then '
+        f'echo "占用 {h.port} 的："; '
+        # 先看清楚杀的是什么再杀 —— 这台上可能跑着别人的东西
+        f"ps -o pid=,user=,cmd= -p $P 2>/dev/null | cut -c1-110; "
+        f"kill $P 2>/dev/null; sleep 1; kill -9 $P 2>/dev/null; echo 已清理; "
+        f"else echo '{h.port} 空闲'; fi"
+    )
 
 
 def probe_status(h: Host) -> tuple[Host, str]:
@@ -446,6 +485,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--local", action="store_true",
                     help="不走 ssh，在本机执行（用于同机演练与自测）")
     ap.add_argument("--parallel", type=int, default=16)
+    ap.add_argument("--by-port", action="store_true",
+                    help="stop 时连**占着端口的进程**一起清。`pkill -f` 只认命令行"
+                         "模式，上一轮手工起的或参数顺序不同就漏掉了 —— 而漏掉的"
+                         "代价是下一轮 Address already in use。会先把杀掉的进程打出来")
     ap.add_argument("--progress-every", type=float, default=30.0, metavar="秒",
                     help="fetch 期间多久报一次进度（0=关）。问的是各节点输出目录"
                          "的大小 —— 几小时的操作没有中间输出的话，"
@@ -521,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
         # ssh 是 launch 的便利，不是框架的依赖。打印出来自己跑，结果一模一样。
         for h in hosts:
             cmd = (_start_cmd(h, args.workdir, args.python, args.logdir)
-                   if args.action == "start" else _stop_cmd(h))
+                   if args.action == "start" else _stop_cmd(h, by_port=args.by_port))
             print(f"# {h.node_id} @ {h.host}\n{cmd}\n")
         return 0
 
@@ -535,7 +578,8 @@ def main(argv: list[str] | None = None) -> int:
                            if args.action == "start" else _local_stop(h))
             else:
                 cmd = (_start_cmd(h, args.workdir, args.python, args.logdir)
-                       if args.action == "start" else _stop_cmd(h))
+                       if args.action == "start"
+                       else _stop_cmd(h, by_port=args.by_port))
                 ok, msg = _ssh(h, cmd, ssh=args.ssh, user=args.user)
             return h, ok, msg[:120]
         except Exception as e:
