@@ -383,6 +383,17 @@ def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetu
 
     # ---------------- toy 模型（默认）---------------------------------- #
     if not args.model_dir:
+        # **横幅要显眼。** toy 模型不需要任何下载的权重，所以「没下成功」和
+        # 「跑的是 toy」这两件事在日志里长得一模一样 —— 都是顺利跑出 token。
+        # 而 toy 的时延（毫秒级）与真模型（百毫秒级）差一个量级，
+        # 拿它当测量结果会得出完全错误的结论。
+        log.warning("=" * 68)
+        log.warning("⚠ 没给 --model-dir —— 跑的是 **toy 模型**"
+                    "（8 层 × 32 专家的 numpy 玩具）")
+        log.warning("  它不加载任何真实权重，时延数字与 80B 的真实部署无关。")
+        log.warning("  要跑真模型：--model-dir <各节点上的权重目录> --profile <画像>")
+        log.warning("  （走 ./deploy_15.sh measure 会自动带上这些）")
+        log.warning("=" * 68)
         mcfg = ToyMoEConfig()
         spec = toy_model_spec(mcfg)
         corpus = make_corpus(mcfg, names, seed=args.seed, shared_clusters=0)
@@ -1103,12 +1114,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if rows:
         p50 = float(np.median([m for _, m in rows]))
+        # 汇总行**必须带上跑的是什么** —— 时延数字脱离了后端就没有意义。
+        who = (f"{setup.label}/{setup.backend}"
+               if setup.backend != "numpy" else "toy 玩具模型（非真实权重）")
         if args.static:
-            log.info("汇总：%d 条完成，逐 token p50 %.0fms，换绑 %d 次（静态模式恒为 0）",
-                     len(rows), p50, sum(r.rebinds for r, _ in rows))
+            log.info("汇总[%s]：%d 条完成，逐 token p50 %.0fms，换绑 %d 次（静态模式恒为 0）",
+                     who, len(rows), p50, sum(r.rebinds for r, _ in rows))
         else:
-            log.info("汇总：识别 %d/%d，逐 token p50 %.0fms，换绑 %d 次",
-                     sum(r.correct for r, _ in rows), len(rows), p50,
+            log.info("汇总[%s]：识别 %d/%d，逐 token p50 %.0fms，换绑 %d 次",
+                     who, sum(r.correct for r, _ in rows), len(rows), p50,
                      sum(r.rebinds for r, _ in rows))
         log.info("配对历史（每条请求用了哪对段）：")
         for req, f, b, u in coord.pairings:

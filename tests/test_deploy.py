@@ -221,7 +221,14 @@ def test_multinode_15_nodes_end_to_end() -> None:
     out = r.stdout + r.stderr
     assert r.returncode == 0, out[-3000:]
     assert "清单校验 通过" in out, out[-3000:]
-    assert "汇总：识别 2/2" in out, out[-2000:]
+    # 汇总行现在带着后端标签：`汇总[toy 玩具模型（非真实权重）]：识别 2/2`。
+    # 那个标签不是装饰 —— toy 不加载任何下载的权重，所以「权重没下成功」与
+    # 「跑的是 toy」在日志里长得一模一样，而两者的时延差一个量级。
+    assert "识别 2/2" in out, out[-2000:]
+    assert "汇总[" in out, "汇总行没带后端标签"
+    assert "玩具" in out or "非真实权重" in out, (
+        "本地多进程跑的就是 toy —— 汇总里必须写明，否则这些毫秒数会被"
+        "当成真实部署的测量结果")
 
     bad = set(re.findall(r"(n\d+)=\d+±\d+\[劣\]", out))
     assert len(bad) >= 2, f"没解析到劣质节点: {out[:600]}"
