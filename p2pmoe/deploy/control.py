@@ -305,6 +305,78 @@ def _load_profile_file(path: Path, tasks: Sequence[str], n_layers: int,
     return plcs, (profs or None)
 
 
+def _where_is_it_stuck(rec, coord, addrs, pool) -> None:
+    """请求超时了 —— 去问路径上的每台节点它自己怎么看。
+
+    协调器这一侧的事件日志只能说到「派发出去了」为止；派发之后的沉默有好几种
+    完全不同的原因，而它们在日志里长得一模一样：
+
+        · 段首根本没收到 seg_in（消息没送到，或它在忙别的）
+        · 收到了但还没装载完模型（第一条请求常撞上，装几十 GB 要时间）
+        · 装载失败了（错误上报走的是另一条路，可能还没到）
+        · 算到一半卡在某一跳（段内逐跳，任何一跳挂了都表现为整体沉默）
+
+    分辨它们只要一件事：**问节点自己**。
+
+    先问 `capabilities` 而不是 `stats` —— **`stats` 在配置之前答不了**
+    （返回 `{"type": "error", ...}`），而「压根没配置成功」恰恰是最常见的
+    那一种。`capabilities` 从起进程那一刻就能答，还顺带告诉你 configured。
+    """
+    from p2pmoe.runtime.wire import rpc
+
+    log.error("  —— 路径上各节点的自述：")
+    segs = [x for x in (rec.front, rec.back) if x]
+    if not segs:
+        log.error("     （还没绑上任何段 —— 那是排队问题，不是节点问题）")
+        return
+    nodes: list[tuple[str, str]] = []
+    for sid in segs:
+        info = coord.man.segments.get(sid)
+        if info:
+            nodes += [(sid, n) for n in info["nodes"]]
+
+    def ask(nid, addr, what):
+        return rpc(addr, {"type": what}, timeout=8.0, relay=RELAY,
+                   me="__coord__", to=nid)
+
+    for sid, nid in nodes:
+        a = addrs.get(nid)
+        if a is None:
+            log.error("     %-6s %-6s ✗ 不在 --agents 里 —— 它永远不会响应",
+                      sid, nid)
+            continue
+        try:
+            cap = ask(nid, a, "capabilities")
+        except Exception as e:
+            log.error("     %-6s %-6s ✗ 问不到（进程没了？端口不通？）：%s",
+                      sid, nid, f"{type(e).__name__}: {e}"[:60])
+            continue
+        if not cap.get("configured"):
+            log.error("     %-6s %-6s ✗ **进程活着但还没配置** —— "
+                      "下发没到，或装载失败了", sid, nid)
+            continue
+        try:
+            st = ask(nid, a, "stats")
+        except Exception as e:
+            log.error("     %-6s %-6s 已配置，但问 stats 失败：%s",
+                      sid, nid, f"{type(e).__name__}"[:40])
+            continue
+        log.error("     %-6s %-6s 层 %s  驻留 %.1fGB  装载 %.0fms  "
+                  "算过 %.0fms  收发 %d 条",
+                  sid, nid, _span(st.get("layers")),
+                  st.get("resident_mb", 0) / 1024, st.get("load_ms", 0),
+                  st.get("compute_ms", 0), st.get("msgs", 0))
+    log.error("  —— 怎么读：**算过 0ms** 的那台就是没开始干活的那台。")
+    log.error("     它是段首 → seg_in 没送到；不是段首 → 上一跳卡住了。")
+    log.error("     全都算过却没出 token → 看下面「节点上报的错误」。")
+
+
+def _span(layers) -> str:
+    if not layers:
+        return "—"
+    return f"{layers[0]}–{layers[-1]}" if len(layers) > 1 else str(layers[0])
+
+
 def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetup:
     """步骤 0：决定跑哪个模型、每层装哪些专家。"""
     names = [u for u, _ in tasks_lam]
@@ -603,6 +675,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="跳过「每台节点能不能读到 checkpoint」的预检")
     ap.add_argument("--prompt", action="append", default=None,
                     help="文本 prompt，可重复。需要 --model-dir")
+    ap.add_argument("--req-timeout", type=float, default=300.0, metavar="秒",
+                    help="单条请求等多久算超时。默认 300s —— 第一条要等模型装载"
+                         "（真模型几十 GB，几分钟很正常）。调试时调小些能更快看到"
+                         "卡在哪台")
     ap.add_argument("--warmup", type=int, default=0, metavar="N",
                     help="先跑 N 条**不计入结果**的请求。torch 首次前向要选 kernel、"
                          "分配显存池、把权重从 mmap 拉进页缓存 —— 这些都只发生一次。"
@@ -950,10 +1026,15 @@ def main(argv: list[str] | None = None) -> int:
 
     def drain(batch_):
         for rec in batch_:
-            if not rec.done.wait(timeout=300):
-                log.error("%s 超时。已发生的事件：", rec.req)
+            if not rec.done.wait(timeout=args.req_timeout):
+                log.error("%s 等了 %.0fs 还没完成。协调器这边看到的：",
+                          rec.req, args.req_timeout)
                 for e in rec.events:
                     log.error("    %s", e)
+                try:
+                    _where_is_it_stuck(rec, coord, addrs, pool)
+                except Exception as e:      # 诊断本身不该盖住原始故障
+                    log.debug("问节点失败：%s", e)
                 continue
             per = sorted(rec.token_ms)
             p50 = per[len(per) // 2] if per else 0.0

@@ -174,8 +174,49 @@ class Coordinator:
         else:
             self.front_pools = {}
 
-        self.seg_head = {sid: info["head"] for sid, info in manifest.segments.items()}
+        self.seg_head = {sid: info.get("head") or list(info["nodes"])[0]
+                         for sid, info in manifest.segments.items()}
         self.seg_nodes = {sid: list(info["nodes"]) for sid, info in manifest.segments.items()}
+        # 段记录里没写 tail/head 的话退回列表两端 —— 有些精简清单（测试夹具、
+        # 手写布局）只给 nodes。退回不是妥协：Segment.tail 的定义就是 nodes[-1]，
+        # 两个字段都在时下面那段检查会确认它们相等。
+        self.seg_tail = {sid: info.get("tail") or list(info["nodes"])[-1]
+                         for sid, info in manifest.segments.items()}
+
+        # 段的「谁是头/尾」有**两个来源**，它们必须一致：
+        #   · 段记录里的 head / tail 字段 —— 协调器按它发 bind
+        #   · 逐节点计划里的 is_head / is_tail —— 节点按它决定跑不跑 _front_tail
+        # 不一致的后果极其难查：bind 发给了一台没有 L₀ 输出的节点（它报
+        # 「bind 时没有可发的 L₀ 输出」），而真正的尾段永远等不到 bind，
+        # 于是请求挂到 300 秒超时，后面同池的请求跟着一起排队饿死。
+        # 这个检查很便宜，放在这里让它在**启动时**就炸，而不是拖到第一条请求。
+        bad = []
+        for p_ in manifest.nodes:
+            sid = getattr(p_, "segment", None)
+            if sid not in self.seg_nodes:
+                continue
+            # 精简的节点计划可能没有 is_head/is_tail（测试夹具、手写布局）——
+            # 缺了就跳过这一项，别把「信息不全」当成「自相矛盾」。
+            if getattr(p_, "is_tail", None) and self.seg_tail.get(sid) != p_.node:
+                bad.append(f"{sid}: 节点计划说 {p_.node} 是尾，"
+                           f"段记录说是 {self.seg_tail.get(sid)}")
+            if getattr(p_, "is_head", None) and self.seg_head.get(sid) != p_.node:
+                bad.append(f"{sid}: 节点计划说 {p_.node} 是头，"
+                           f"段记录说是 {self.seg_head.get(sid)}")
+        for sid, ns in self.seg_nodes.items():
+            info = manifest.segments[sid]
+            # 只在段记录**明确写了** tail/head 时才比 —— 没写的话
+            # seg_tail 本来就是从 nodes 推的，比了等于自己跟自己比。
+            if info.get("tail") and self.seg_tail.get(sid) != ns[-1]:
+                bad.append(f"{sid}: nodes[-1]={ns[-1]} 与 tail={self.seg_tail[sid]} 不符")
+            if info.get("head") and self.seg_head.get(sid) != ns[0]:
+                bad.append(f"{sid}: nodes[0]={ns[0]} 与 head={self.seg_head[sid]} 不符")
+        if bad:
+            raise ValueError(
+                "清单自相矛盾 —— 段的头/尾在两处说法不一致：\n  "
+                + "\n  ".join(bad)
+                + "\n协调器按段记录发 bind，节点按自己的 is_tail 决定是否产出 L₀ 输出；"
+                  "两者不符时请求会挂到超时。")
 
         self.records: dict[str, RequestRecord] = {}
         # 有界等待（II.5「池满 → 有界等待」）：池子空了不是错误，是排队。
@@ -476,8 +517,12 @@ class Coordinator:
                 + (f"，排队等了 {w:.0f}ms" if w > 1 else ""))
         with self._lock:
             self.pairings.append((rec.req, rec.front, b, task))
-        # 告诉 tail(f) 绑到谁；它会把**缓存的** L₀ 输出发过去，前段一层不重算
-        tail = self.seg_nodes[rec.front][-1]
+        # 告诉 tail(f) 绑到谁；它会把**缓存的** L₀ 输出发过去，前段一层不重算。
+        # 用段记录里的 tail 字段，**不靠 nodes[-1] 推断** —— 后者与节点自己的
+        # is_tail 是两个来源，一旦不一致，bind 就发给了没有 L₀ 输出的那台。
+        # （构造时它们相等，但手写清单、改过的 JSON、别的翻译路径都可能打破。
+        #   构造期的一致性已经在 __init__ 里查过了，这里只是不再依赖那个巧合。）
+        tail = self.seg_tail[rec.front]
         self.pool.send(tail, {"type": "bind", "req": rec.req, "target": self.seg_head[b],
                               "task": task, "rebind": rebind}, delay=False)
 

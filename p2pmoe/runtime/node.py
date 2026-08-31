@@ -567,8 +567,21 @@ class NodeServer:
         s.task = h.get("task")
         payload = s.pending if s.pending is not None else s.cached_l0
         if payload is None:
-            self._report({"type": "error", "req": req, "node": self.me,
-                          "trace": "bind 时没有可发的 L₀ 输出"})
+            # 这台从来没跑过这条请求的前段 —— 说明 bind 发错了地方。
+            # 报错要带足够的东西让人当场判断：谁、什么角色、手里有哪些请求。
+            # 只说「没有可发的输出」的话，读的人还得去猜是哪条请求、哪一段。
+            known = sorted(self._reqs)[:6]
+            self._report({
+                "type": "error", "req": req, "node": self.me,
+                "trace": (
+                    f"bind({req}) 时没有可发的 L₀ 输出 —— 本机没跑过这条请求的前段。"
+                    f" 本机角色={self.cfg.role if self.cfg else '?'}"
+                    f" 段={self.cfg.segment if self.cfg else '?'}"
+                    f" is_tail={self.cfg.is_tail if self.cfg else '?'};"
+                    f" 手里的请求={known or '无'}。"
+                    f" bind 应该发给该段**真正的尾节点** —— 段记录的 tail 与各节点"
+                    f"自己的 is_tail 对不上时就会发到这里。"),
+            })
             return
         s.pending = None
         # 换绑走的也是这条路：把**缓存的** L₀ 输出重发给新后段，前段一层都不重算
