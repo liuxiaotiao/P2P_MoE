@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import sys
@@ -504,12 +505,14 @@ def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None,
     算力用 agent 自己跑的 matmul 基准，归一化成相对值。比填铭牌值好，因为它
     包含了当时的实际负载与降频 —— 规划器要的就是「现在真能跑多快」。
     """
+    refused: list[tuple[str, Exception]] = []
     caps: dict[str, dict] = {}
     for name, addr in addrs.items():
         try:
             r = _rpc(name, addr, {"type": "capabilities"}, timeout=15.0)
         except Exception as e:
             log.error("agent %s@%s:%d 无法连接：%s —— 已从池中剔除", name, *addr, e)
+            refused.append((name, e))
             continue
         if r.get("configured"):
             log.warning("agent %s 已被配置过，将被重新下发", name)
@@ -517,6 +520,38 @@ def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None,
         log.info("  %-8s 内存 %8.0fMB  基准 %.3fms", name, r["mem_mb"], r["ms_per_layer"])
 
     if not caps:
+        # 「一台都连不上」和「掉了几台」是完全不同的事，不该共用同一句话。
+        # 而 errno 又把它分成两种，处置也不同：
+        #   ECONNREFUSED  主机在、端口上没人监听 → **agent 没跑**
+        #   超时 / 不可达  包都没到 → 网络、防火墙、地址写错
+        n_ref = sum(1 for _, e in refused
+                    if isinstance(e, OSError) and e.errno == errno.ECONNREFUSED)
+        log.error("")
+        log.error("=" * 68)
+        log.error("%d 台一个都没连上 —— 这不是「掉了几台」，是根本没起来。",
+                  len(refused))
+        if n_ref == len(refused):
+            log.error("")
+            log.error("全部是 Connection refused：**主机是通的，只是端口上没人监听**。")
+            log.error("换句话说 agent 进程不在跑。最常见的原因是上一轮 stop 之后没再 start。")
+            log.error("")
+            log.error("    bash ./deploy_15.sh start      # 起 agent，它会自己验活")
+            log.error("    bash ./deploy_15.sh check      # 确认 15/15 在线")
+            log.error("")
+            log.error("start 报成功却还是连不上的话，看日志：")
+            log.error("    bash ./deploy_15.sh logs       # 或 doctor 逐台体检")
+        elif n_ref == 0:
+            log.error("")
+            log.error("没有一台回 Connection refused —— 包根本没到。")
+            log.error("查地址与防火墙，而不是 agent：")
+            log.error("    bash ./deploy_15.sh check      # 逐台探连通性")
+            log.error("    （hosts.txt 里的 IP 对不对？9101 放行了吗？）")
+        else:
+            log.error("")
+            log.error("%d 台拒绝连接（agent 没跑）、%d 台不可达（网络）—— 两种都有。",
+                      n_ref, len(refused) - n_ref)
+            log.error("    bash ./deploy_15.sh doctor     # 逐台分开看")
+        log.error("=" * 68)
         raise SystemExit("没有任何 agent 可用")
 
     fastest = min(c["ms_per_layer"] for c in caps.values())

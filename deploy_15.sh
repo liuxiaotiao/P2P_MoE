@@ -12,6 +12,7 @@
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
 #   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
+#   ./deploy_15.sh identity   # 15 个 id 是不是落在 15 台不同机器/目录上
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
 #   ./deploy_15.sh disk       # 逐台磁盘：份额 vs 实占 vs 幽灵，一张表
 #   ./deploy_15.sh start      # 起 agent
@@ -444,8 +445,37 @@ cmd_start() {
 
 # 动态模式：请求随机到达任意前段 → 前段本地识别 task → 派发到该 task 的后段。
 # **不加 --static** —— 静态配对下一条前段绑死一个 task，随机来的请求接不住。
+# 打请求之前先确认 agent 在跑。
+#
+# 不查的话要等控制器把 15 台挨个探一遍才报错，而那一屏全是
+# 「无法连接 …… 已从池中剔除」—— 15 行一模一样的红字，真正的结论在最后。
+_require_agents() {
+  local up=0 tot=0
+  while read -r id ip port; do
+    tot=$((tot+1))
+    ($PY - "$ip" "$port" <<'PYEOF'
+import socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()
+except OSError:
+    sys.exit(1)
+PYEOF
+    ) 2>/dev/null && up=$((up+1))
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1], (a[2]?a[2]:9101)}' "$HOSTS")
+  [ "$up" = "$tot" ] && { echo "  agent $up/$tot 在线 ✓"; return 0; }
+  echo "  ✗ agent 只有 $up/$tot 在线"
+  [ "$up" = 0 ] && {
+    echo "    一台都没有 —— agent 进程不在跑（stop 之后忘了 start 是最常见的）："
+    echo "        bash ./deploy_15.sh start"
+    return 1; }
+  echo "    掉线的那几台会被自动剔除，但通道数会跟着少。要么先修，要么接受降容量。"
+  echo "        bash ./deploy_15.sh logs      # 看它们为什么没起来"
+  return 1
+}
+
 cmd_serve() {
   say "5. 建链 + 服务（动态：盲绑 → 识别 → 派发）"
+  _require_agents || return 1
   $PY -m p2pmoe.deploy.control \
       --agents "$(AGENTS)" --advertise "$ADVERTISE" \
       --load-plan "$PLAN" \
@@ -1036,6 +1066,91 @@ cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") -m p2pmoe.deploy.fetch \
   cmd_verify "$id"
 }
 
+# 15 个节点 id 是不是真的落在 15 台**不同的机器 / 不同的目录**上。
+#
+# 症状：某台反复重下，拿到的却总是另一台那份。最可能的解释不是下载出错，
+# 而是**两个节点 id 指向同一处** —— 同一台机器的两个 IP、NAT 后面的同一台、
+# 或者 $WEIGHTS 落在同一个共享盘上。那样两条 fetch 会互相覆盖，
+# 谁后完成谁留下，重下多少次都一样。
+#
+# 做法：先让每台往自己的 $WEIGHTS 里写一个写着自己 id 的标记，再回头读一遍。
+# 读出别人的 id，就说明这两个 id 共用一处。
+cmd_identity() {
+  need "$HOSTS"
+  say "I. 节点身份与目录归属"
+  local d; d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  local ids=()
+
+  # 第一趟：各自写标记 + 报告身份
+  while read -r id ip; do
+    ids+=("$id:$ip")
+    ( ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" \
+        "mkdir -p $(printf %q "$WEIGHTS") 2>/dev/null; \
+         echo $(printf %q "$id") > $(printf %q "$WEIGHTS")/.whoami; \
+         echo \"host=\$(hostname) mid=\$(cat /etc/machine-id 2>/dev/null | cut -c1-8) \
+real=\$(readlink -f $(printf %q "$WEIGHTS")) \
+dev=\$(stat -c %d:%i $(printf %q "$WEIGHTS") 2>/dev/null)\"" \
+        </dev/null > "$d/$id.a" 2>&1; echo $? > "$d/$id.rc" ) &
+  done < <(awk '{sub(/#.*/,"")} NF>=2 {split($2,a,":"); print $1, a[1]}' "$HOSTS")
+  wait
+  sleep 1
+
+  # 第二趟：读回标记。读到别人的 id = 共用一处
+  for e in "${ids[@]}"; do
+    local id=${e%%:*} ip=${e#*:}
+    ( ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-} \
+        "${SSH_USER:+$SSH_USER@}$ip" \
+        "cat $(printf %q "$WEIGHTS")/.whoami 2>/dev/null" \
+        </dev/null > "$d/$id.b" 2>&1 ) &
+  done
+  wait
+
+  # 表头用 ASCII —— printf 按字符数补宽，中文占两列会把整张表拧歪
+  printf '  %-6s%-16s%-11s%-8s%s\n' node hostname machine-id marker dir
+  echo "  $(printf '─%.0s' $(seq 1 76))"
+  local clash=0
+  for e in "${ids[@]}"; do
+    local id=${e%%:*} ip=${e#*:}
+    if [ "$(cat "$d/$id.rc" 2>/dev/null)" != 0 ]; then
+      printf '  %-6s✗ ssh 连不上\n' "$id"; continue
+    fi
+    local a b host mid real mark
+    a=$(cat "$d/$id.a" 2>/dev/null); b=$(tr -d ' \n' < "$d/$id.b" 2>/dev/null)
+    host=$(sed -n 's/.*host=\([^ ]*\).*/\1/p' <<<"$a")
+    mid=$(sed -n 's/.*mid=\([^ ]*\).*/\1/p' <<<"$a")
+    real=$(sed -n 's/.*real=\([^ ]*\).*/\1/p' <<<"$a")
+    mark=${b:-?}
+    local flag=""
+    [ "$mark" != "$id" ] && { flag="  ⚠ 标记是 $mark"; clash=$((clash+1)); }
+    printf '  %-6s%-16s%-11s%-10s%s%s\n' "$id" "${host:0:15}" "$mid" "$mark" "${real:0:26}" "$flag"
+  done
+
+  echo
+  # 主机名/machine-id 撞车也要点出来 —— 同一台机器两个 IP 是常见配错
+  awk '{print}' "$d"/*.a 2>/dev/null \
+    | sed -n 's/.*mid=\([^ ]*\).*/\1/p' | sort | uniq -d | while read -r m; do
+      echo "  ⚠ machine-id $m 出现在多台上 —— 它们其实是同一台机器"
+    done
+
+  if [ "$clash" -gt 0 ]; then
+    say "结论"
+    echo "  $clash 台读回来的标记不是自己的 —— 这些 id **共用同一个目录**。"
+    echo "  两条 fetch 会互相覆盖，谁后完成谁留下 —— 重下多少次都一样。"
+    echo
+    echo "  查两件事："
+    echo "    1. hosts.txt 里那两台是不是同一台机器（看上面的主机名 / machine-id）"
+    echo "    2. \$WEIGHTS 是不是落在共享盘上（看「目录」那列的真实路径）"
+    echo
+    echo "  真是同一台机器的话，这个部署放不下 15 条独立通道 —— 清单要重算。"
+    echo "  是共享盘的话，给每台一个独立目录："
+    echo "      export WEIGHTS=\$WORKDIR/weights-\$(hostname)   # 或按节点 id"
+    return 1
+  fi
+  echo "  15 个 id 各自落在独立的目录上 ✓"
+  return 0
+}
+
 cmd_stop() {
   say "停 agent"
   local extra=()
@@ -1059,6 +1174,7 @@ case "$action" in
   diag)    cmd_diag ;;
   verify)  cmd_verify "${1:-}" ;;
   refetch) cmd_refetch "${1:-}" ;;
+  identity) cmd_identity ;;
   whereis) cmd_whereis "${1:-}" ;;
   disk)    cmd_disk ;;
   serve-weights) cmd_serve_weights "${1:-}" ;;
@@ -1070,6 +1186,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop "${1:-}" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|whereis|disk|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|identity|whereis|disk|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac
