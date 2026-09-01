@@ -103,19 +103,33 @@ RELAY: Addr | None = None
 参数，不如认一个事实：一次部署要么全走中继，要么全不走，没有一半一半。"""
 
 
-def _still_listening(addr: Addr, timeout: float = 3.0) -> bool:
-    """端口还有人听吗。
+def _probe_agent(node: str, addr: Addr, timeout: float = 8.0) -> str:
+    """这台 agent 现在是什么状态。返回 "alive" / "wedged" / "gone"。
 
-    用来把「装得慢」和「进程死了」分开 —— 两者都表现为 RPC 超时，
-    但一个是等，一个是查 OOM。
+    **只做 TCP connect 是不够的。** 监听 socket 还在、内核就会把连接收进
+    backlog —— 进程卡死在一个永不返回的系统调用里（挂掉的 NFS、坏掉的块设备）
+    照样能连上。那样得到的「进程活着」是个假信号，会把人往「再等等」引，
+    而实际上等到天荒地老也不会好。
+
+    agent 是**每连接一个线程**（`NodeServer.serve_forever`），所以它在装载
+    模型的同时仍然应答得了 `capabilities`。于是：
+
+        连得上 + 答得出  → 真的只是在装，等就是了
+        连得上 + 不答    → **卡死**，等没有意义
+        连不上          → 进程没了
     """
     import socket as _s
 
     try:
-        with _s.create_connection(addr, timeout=timeout):
-            return True
+        with _s.create_connection(addr, timeout=min(3.0, timeout)):
+            pass
     except OSError:
-        return False
+        return "gone"
+    try:
+        rpc(addr, {"type": "capabilities"}, timeout=timeout, relay=RELAY, to=node)
+        return "alive"
+    except Exception:
+        return "wedged"
 
 
 def _rpc(node: str, addr: Addr, header: dict, *, timeout: float = 30.0) -> dict:
@@ -709,7 +723,7 @@ def distribute(
         except (TimeoutError, OSError) as e:
             # 裸异常只说「timed out」，不说是谁、在装什么、还活着没有 ——
             # 而那三件事决定了下一步往哪查。
-            alive = _still_listening(addrs[p.node])
+            state = _probe_agent(p.node, addrs[p.node])
             log.error("")
             log.error("=" * 68)
             log.error("配置 %s 超时（等了 %.0fs）：%s", p.node, budget, e)
@@ -718,16 +732,33 @@ def distribute(
                       gb)
             log.error("  上一台成功的是 %s —— 说明链路本身是通的。",
                       acks[-1]["node"] if acks else "（这是第一台）")
-            if alive:
+            if state == "alive":
                 log.error("")
-                log.error("  端口还在听 —— 进程活着，只是**还没装完**。")
+                log.error("  进程**应答得了**别的请求 —— 它只是还没装完。")
                 log.error("  盘慢或页缓存冷的话 %.1fGB 可能真要更久：", gb)
                 log.error("      在 %s 上看：tail -f /tmp/p2pmoe/agent-%s.log",
                           addrs[p.node][0], p.node)
-                log.error("      加大预算重跑：CONFIGURE_GB_SEC=60 bash ./deploy_15.sh measure")
+                log.error("      给足时间重跑：FETCH_TIMEOUT 之外还有 configure 预算，"
+                          "把这台的份额调小或换更快的盘")
+            elif state == "wedged":
+                log.error("")
+                log.error("  **端口连得上，但进程不应答** —— 它卡死了，不是在慢慢装。")
+                log.error("  （agent 是每连接一个线程，装载中也该答得出 capabilities；")
+                log.error("   答不出说明卡在一个不返回的系统调用里。）")
+                log.error("")
+                log.error("  %.1fGB 本该几秒装完，卡在这里最常见的是**存储**：", gb)
+                log.error("      在 %s 上：", addrs[p.node][0])
+                log.error("          mount | grep -E 'nfs|cifs|fuse'   # 权重在网络盘上？")
+                log.error("          ls %s                             # 会不会直接卡住", "$WEIGHTS")
+                log.error("          cat /proc/$(pgrep -f 'agent --id %s')/stack 2>/dev/null",
+                          p.node)
+                log.error("          dmesg -T | tail -20               # I/O 错误 / nfs timeout")
+                log.error("      D 状态（不可中断睡眠）的进程 kill -9 也杀不掉：")
+                log.error("          ps -o pid,stat,wchan:24,cmd -p $(pgrep -f 'agent --id %s')",
+                          p.node)
             else:
                 log.error("")
-                log.error("  **端口已经不听了 —— 进程死了。**")
+                log.error("  **连不上了 —— 进程没了。**")
                 log.error("  装 %.1fGB 的时候被杀掉，最可能是 OOM：", gb)
                 log.error("      在 %s 上看：dmesg -T | tail -20 | grep -i oom",
                           addrs[p.node][0])
