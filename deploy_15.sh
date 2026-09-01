@@ -11,6 +11,7 @@
 #   ./deploy_15.sh diag       # 源站诊断：大文件和小文件是不是两个域名
 #   ./deploy_15.sh serve-weights <目录>  # 上游拉不动时：一台发，15 台切片
 #   ./deploy_15.sh verify     # 逐台核对权重齐不齐（只读文件头，几秒）
+#   ./deploy_15.sh refetch <节点>  # 清掉旧产物再单独重拉一台
 #   ./deploy_15.sh whereis    # 权重在哪、内存被谁占着（目录空了但内存满时用）
 #   ./deploy_15.sh disk       # 逐台磁盘：份额 vs 实占 vs 幽灵，一张表
 #   ./deploy_15.sh start      # 起 agent
@@ -753,6 +754,8 @@ from p2pmoe.deploy.fetch import keys_for_node
 from p2pmoe.planner.manifest import DeploymentManifest
 from p2pmoe.runtime.weights import WeightIndex
 
+import re
+
 plan, node, wdir = sys.argv[1], sys.argv[2], sys.argv[3]
 cfg = json.loads((Path(wdir) / "config.json").read_text(encoding="utf-8"))
 man = DeploymentManifest.from_json(Path(plan).read_text(encoding="utf-8"))
@@ -760,8 +763,23 @@ want = keys_for_node(man, node, config=cfg)
 have = set(WeightIndex(wdir).weight_map)
 miss = want - have
 gb = sum(f.stat().st_size for f in Path(wdir).glob("*.safetensors")) / 1e9
+
+
+def span(keys):
+    """这些 key 覆盖哪些层（转回 1-based，与清单同口径）。"""
+    ls = {int(m.group(1)) + 1 for k in keys
+          for m in [re.search(r"model\.layers\.(\d+)\.", k)] if m}
+    return (min(ls), max(ls)) if ls else None
+
+
 if miss:
-    print(f"MISS {len(miss)}/{len(want)} {gb:.1f}GB {sorted(miss)[0]}")
+    # 只说「缺多少个」不够 —— 全缺时最可能的原因是**装的是别人那份**，
+    # 而那要对比「本地实际有哪些层」和「清单要哪些层」才看得出来。
+    hs, ws = span(have), span(want)
+    print(f"MISS {len(miss)}/{len(want)} {gb:.1f}GB {sorted(miss)[0]} "
+          f"have={hs[0]}-{hs[1] if hs else '?'} want={ws[0]}-{ws[1] if ws else '?'}"
+          if hs and ws else
+          f"MISS {len(miss)}/{len(want)} {gb:.1f}GB {sorted(miss)[0]} have=? want=?")
     sys.exit(1)
 print(f"OK {len(want)} {gb:.1f}GB")
 PYEOF
@@ -776,7 +794,8 @@ PYEOF
     case "$out" in
       OK\ *)   set -- $out; printf '  ✓ %-5s %s 个张量  %s\n' "$id" "$2" "$3"; ok=$((ok+1)) ;;
       MISS\ *) set -- $out
-               printf '  ✗ %-5s 缺 %s  已有 %s  首个: %s\n' "$id" "$2" "$3" "$4"
+               printf '  ✗ %-5s 缺 %s  本地 %s  %s %s\n' "$id" "$2" "$3" "$5" "$6"
+               printf '        首个缺失: %s\n' "$4"
                bad=$((bad+1)) ;;
       *)       printf '  ? %-5s %s\n' "$id" "$(echo "$out" | head -1)"; bad=$((bad+1)) ;;
     esac
@@ -786,9 +805,13 @@ PYEOF
     echo "  $ok/$ok 台的权重与清单一致 —— 可以 start 了。"
     return 0
   fi
-  echo "  $bad 台对不上。最常见的原因：**改了 COVERAGE 之后没重跑 fetch** ——"
-  echo "  驻留集变了，权重还是旧的那份。重跑：bash ./deploy_15.sh fetch"
-  echo "  （fetch 会跳过已有的分片，只补缺的）"
+  echo "  $bad 台对不上。看那一行的 have= 与 want=："
+  echo "    · 两个区间**完全不同** → 装的是**别的节点**那一份。"
+  echo "      多半是上一轮 fetch 的 --node 传错了，或者这台的 fetch 没跑成功而"
+  echo "      目录里留着更早的产物。单独重跑那一台："
+  echo "          bash ./deploy_15.sh refetch <节点>"
+  echo "    · 区间相同、只缺一部分 → 驻留集变了（改过 COVERAGE），重跑 fetch。"
+  echo "    · have=? → 本地压根没有权重文件。"
   return 1
 }
 
@@ -981,6 +1004,38 @@ else:
 PYEOF
 }
 
+# 单独重拉一台，**先把旧产物清干净**。
+#
+# `fetch` 写的是 out/model.safetensors，正常情况下会覆盖。但如果上一轮是
+# 以别的 --node 跑的、或者中途失败留下了半成品，目录里就可能坐着一份
+# 不属于这台的权重 —— 而重跑 fetch 只要有一步先失败，那份就一直留着。
+# 所以这里显式删掉再拉，让「重来一次」真的是从零开始。
+cmd_refetch() {
+  local id=${1:-}
+  [ -n "$id" ] || { echo "用法: $0 refetch <节点id>"; exit 1; }
+  need "$HOSTS"; need "$PLAN"
+  local ip; ip=$(awk -v n="$id" '{sub(/#.*/,"")} $1==n {split($2,a,":"); print a[1]}' "$HOSTS")
+  [ -n "$ip" ] || { echo "hosts.txt 里没有 $id"; exit 1; }
+  say "R. 重拉 $id（先清旧产物）"
+  SRCARG=()
+  if   [ -n "$SRC_DIR" ]; then SRCARG=(--src "$SRC_DIR")
+  elif [ -n "$SRC_URL" ]; then SRCARG=(--base-url "$SRC_URL")
+  else SRCARG=(--repo "$REPO" ${HF_ENDPOINT:+--endpoint "$HF_ENDPOINT"}); fi
+  local srcstr=""
+  for x in "${SRCARG[@]}"; do srcstr="$srcstr $(printf %q "$x")"; done
+  ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS:-} \
+      "${SSH_USER:+$SSH_USER@}$ip" \
+      "rm -f $(printf %q "$WEIGHTS")/*.safetensors \
+$(printf %q "$WEIGHTS")/model.safetensors.index.json; \
+cd $(printf %q "$WORKDIR") && $(printf %q "$NODE_PY") -m p2pmoe.deploy.fetch \
+--plan $(printf %q "$PLAN") --node $(printf %q "$id") \
+--out $(printf %q "$WEIGHTS")$srcstr --transport $(printf %q "$TRANSPORT")" \
+      </dev/null 2>&1 | sed 's/^/  /'
+  echo
+  echo "  核对："
+  cmd_verify "$id"
+}
+
 cmd_stop() {
   say "停 agent"
   local extra=()
@@ -1003,6 +1058,7 @@ case "$action" in
   meta)    cmd_meta ;;
   diag)    cmd_diag ;;
   verify)  cmd_verify "${1:-}" ;;
+  refetch) cmd_refetch "${1:-}" ;;
   whereis) cmd_whereis "${1:-}" ;;
   disk)    cmd_disk ;;
   serve-weights) cmd_serve_weights "${1:-}" ;;
@@ -1014,6 +1070,6 @@ case "$action" in
   doctor)  cmd_doctor "${1:-}" ;;
   stop)    cmd_stop "${1:-}" ;;
   all)     cmd_sync && cmd_check && cmd_fetch && cmd_start && cmd_serve "$@" ;;
-  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|whereis|disk|start|serve|measure|report|logs|doctor|stop|all}
+  *) echo "用法: $0 {sync|bootstrap|cmds|check|fetch|meta|diag|serve-weights|verify|refetch|whereis|disk|start|serve|measure|report|logs|doctor|stop|all}
        serve/measure 后面的参数原样透传给 control.py"; exit 1 ;;
 esac

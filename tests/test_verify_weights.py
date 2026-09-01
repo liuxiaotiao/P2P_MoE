@@ -117,3 +117,64 @@ def test_the_failure_points_at_the_actual_cause() -> None:
     tail = src[i:i + 4000]
     assert "COVERAGE" in tail
     assert "fetch" in tail
+
+
+# --------------------------------------------------------------------------- #
+# 「全缺」时要能分清是哪一种全缺
+# --------------------------------------------------------------------------- #
+def test_the_report_shows_which_layers_are_actually_present(full, tmp_path) -> None:
+    """**真踩过。**
+
+    一台报「缺 3321/3321，本地 22.5GB」—— 缺全部，却又装着东西。
+    只看这两个数字判断不了；对上「本地实际有层 21–48 / 要的是层 12–20」
+    才知道它装的是**别的节点**那一份。
+
+    两种全缺的修法完全不同：装错人要单台重拉，驻留集变了要整轮重跑。
+    """
+    import re
+
+    plan_a = _manifest(3)
+    plan_b = json.loads(json.dumps(plan_a))
+    # B 要的是另一段层 —— 模拟「装了别人那份」
+    for n in plan_b["nodes"]:
+        n["layer_range"] = [L0 + 1, L0 + 2]
+        n["layers"] = [l for l in n["layers"] if l["layer"] <= L0 + 2]
+    plan_b["segments"]["B0"]["splits"] = [[L0 + 1, L0 + 2]]
+
+    out = tmp_path / "w"
+    _fetch_with(plan_a, full, out)          # 装的是 A（层 L0+1..L）
+
+    def span(keys):
+        ls = {int(m.group(1)) + 1 for k in keys
+              for m in [re.search(r"model\.layers\.(\d+)\.", k)] if m}
+        return (min(ls), max(ls)) if ls else None
+
+    want_b = keys_for_node(DeploymentManifest.from_dict(plan_b), "nb", config=CFG)
+    have = set(WeightIndex(str(out)).weight_map)
+    assert span(have) != span(want_b), "构造失败：两边层区间该不同"
+    # 本地有的层区间必须能算出来 —— 这就是报告里 have= 的来源
+    assert span(have) is not None
+
+
+def test_the_script_reports_have_and_want_spans() -> None:
+    """脚本里要真的把这两个区间打出来，否则上面那条推理在现场用不上。"""
+    src = (ROOT / "deploy_15.sh").read_text(encoding="utf-8")
+    i = src.index("cmd_verify")
+    blk = src[i:i + 4000]
+    assert "have=" in blk and "want=" in blk
+    assert "def span" in blk, "没有算层区间的函数"
+
+
+def test_refetch_clears_before_pulling() -> None:
+    """**重来一次必须真的从零开始。**
+
+    `fetch` 正常会覆盖 model.safetensors，但只要有一步先失败，
+    目录里那份不属于这台的旧产物就一直留着 —— 于是「重跑了还是不对」。
+    """
+    src = (ROOT / "deploy_15.sh").read_text(encoding="utf-8")
+    i = src.index("cmd_refetch")
+    blk = src[i:i + 2000]
+    assert "rm -f" in blk, "refetch 没有先清旧产物"
+    i_rm, i_fetch = blk.index("rm -f"), blk.index("p2pmoe.deploy.fetch")
+    assert i_rm < i_fetch, "先拉后删等于没删"
+    assert "index.json" in blk, "索引文件也要清 —— 留着会指向不存在的张量"
