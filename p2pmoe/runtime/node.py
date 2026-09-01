@@ -169,6 +169,15 @@ class NodeConfig:
 
 
 # --------------------------------------------------------------------------- #
+# 会回复的消息类型 —— 出错时必须把错误**也回到那条连接上**，否则调用方
+# 干等到超时，而超时那条信息里什么都没有。
+#
+# 单向消息（seg_in / hop / loop / bind …）不在此列：往那些连接上多发一条
+# 会把协议搞乱，它们的错误本来就该走上报通道。
+_REPLIES = frozenset({"echo", "capabilities", "check_model", "configure",
+                      "probe", "profile"})
+
+
 class NodeServer:
     """两阶段：先起服务，再等控制器下发 configure。
 
@@ -349,8 +358,22 @@ class NodeServer:
                 try:
                     self._dispatch(header, arr, conn)
                 except Exception:
+                    tb = traceback.format_exc()
+                    # 上报给协调器 —— 但**这还不够**。
                     self._report({"type": "error", "node": self.me,
-                                  "trace": traceback.format_exc()[-800:]})
+                                  "trace": tb[-800:]})
+                    # 请求/应答型的消息，调用方正阻塞在 recv 上等回复。
+                    # 只上报不回复的话，它会一直等到超时 —— 而超时那条信息里
+                    # 什么都没有，真正的 traceback 又走了另一条通道
+                    # （下发清单那会儿上报通道可能还没建好，于是彻底丢了）。
+                    # 一个 120 秒的静默超时换来的是零信息，代价太大。
+                    if conn is not None and header.get("type") in _REPLIES:
+                        try:
+                            send_msg(conn, {"type": "error", "node": self.me,
+                                            "for": header.get("type"),
+                                            "trace": tb[-1500:]})
+                        except (OSError, ConnectionError):
+                            pass
         except (ConnectionError, OSError):
             pass
         finally:

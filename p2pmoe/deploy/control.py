@@ -132,8 +132,20 @@ def _probe_agent(node: str, addr: Addr, timeout: float = 8.0) -> str:
         return "wedged"
 
 
+class NodeError(RuntimeError):
+    """节点在处理请求时抛了异常，并把 traceback 回了过来。
+
+    比超时好得多：超时那条信息里什么都没有，而这个带着节点上的真实堆栈。
+    """
+
+
 def _rpc(node: str, addr: Addr, header: dict, *, timeout: float = 30.0) -> dict:
-    return rpc(addr, header, timeout=timeout, relay=RELAY, to=node)
+    r = rpc(addr, header, timeout=timeout, relay=RELAY, to=node)
+    if isinstance(r, dict) and r.get("type") == "error":
+        raise NodeError(
+            f"{node} 处理 {r.get('for', header.get('type'))} 时出错：\n"
+            + str(r.get("trace", "")).rstrip())
+    return r
 
 
 def check_model_dirs(addrs: dict[str, Addr], model_dir: str) -> list[str]:
@@ -720,6 +732,20 @@ def distribute(
             ack = _rpc(p.node, addrs[p.node],
                        {"type": "configure", "config": cfg.to_dict()},
                        timeout=budget)
+        except NodeError as e:
+            # 节点把真实堆栈回过来了 —— 直接摊开，不用再猜。
+            log.error("")
+            log.error("=" * 68)
+            log.error("配置 %s 失败 —— **节点上抛了异常**（不是超时）：", p.node)
+            for line in str(e).splitlines():
+                log.error("  %s", line)
+            log.error("")
+            log.error("  它要装 层 %s，%.1fGB",
+                      f"{p.layer_range[0]}–{p.layer_range[1]}" if p.layer_range else "?",
+                      float(getattr(p, "total_gb", 0) or 0))
+            log.error("  完整日志：bash ./deploy_15.sh logs %s", p.node)
+            log.error("=" * 68)
+            raise SystemExit(f"配置 {p.node} 失败")
         except (TimeoutError, OSError) as e:
             # 裸异常只说「timed out」，不说是谁、在装什么、还活着没有 ——
             # 而那三件事决定了下一步往哪查。
