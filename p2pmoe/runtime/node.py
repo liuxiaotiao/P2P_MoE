@@ -174,6 +174,27 @@ class NodeConfig:
 #
 # 单向消息（seg_in / hop / loop / bind …）不在此列：往那些连接上多发一条
 # 会把协议搞乱，它们的错误本来就该走上报通道。
+def _cuda_state() -> dict:
+    """这台的 CUDA 能不能用 —— 在**装载之前**就要回答得了。
+
+    起不来的话，`--device cuda:0` 的装载会挂在那儿（张量往一个不存在的设备上
+    搬），控制机看到的是一个 120 秒超时，而节点日志里只有一行
+    `CUDA unknown error` 的 UserWarning，淹在几十行正常输出里。
+
+    **探测本身放在执行层**（`runtime/weights.py`），这里只转发 —— node.py
+    不 import torch 是条硬边界（`test_heavy_deps_stay_in_the_execution_layer`）：
+    控制面与数据面的装配代码不该拖进几 GB 的 CUDA 依赖。
+    """
+    try:
+        from .weights import cuda_state
+    except Exception as e:                      # 连执行层都导不进来
+        return {"ok": False, "why": f"导不进执行层：{type(e).__name__}: {e}"[:200]}
+    try:
+        return cuda_state()
+    except Exception as e:
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
+
+
 _REPLIES = frozenset({"echo", "capabilities", "check_model", "configure",
                       "probe", "profile"})
 
@@ -660,7 +681,9 @@ class NodeServer:
     # -- 未配置态：能力与探测 ---------------------------------------------- #
     def capabilities(self) -> dict:
         """上报本机能力。规划器的 Node 表就是由这些回包拼出来的。"""
+        cuda = _cuda_state()
         return {
+            "cuda": cuda,
             "node": self.me,
             "host": self.host,
             "port": self.port,

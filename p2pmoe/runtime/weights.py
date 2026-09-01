@@ -37,6 +37,29 @@ class KeyPlan:
     """是否需要输出头与最终 norm（后段的 tail 需要）。"""
 
 
+def cuda_state() -> dict:
+    """CUDA 现在能不能用，以及不能用时**是哪一种**不能用。
+
+    `torch.cuda.is_available()` 为真也可能在真正分配时才炸（驱动刚被卸载、
+    GPU 被别人独占、ECC 复位中）—— 所以光问不够，要真摸一下。
+
+    「CUDA unknown error」最常见的成因是驱动反复加载卸载：没开持久化模式时，
+    GPU 一空闲就掉驱动，下一个进程再初始化就撞上竞态。
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return {"ok": False, "why": "torch.cuda.is_available() 为假"}
+    n = torch.cuda.device_count()
+    if n == 0:
+        return {"ok": False, "why": "可见 GPU 数为 0"}
+    try:
+        torch.zeros(8, device="cuda:0")     # 光问不够，真分配一次
+    except Exception as e:
+        return {"ok": False, "why": f"分配失败 {type(e).__name__}: {e}"[:200]}
+    return {"ok": True, "n": n, "name": torch.cuda.get_device_name(0)}
+
+
 def qwen_moe_keys(plan: KeyPlan, *, tie_word_embeddings: bool = False) -> set[str]:
     """Qwen3-MoE 的 key 命名 → 本节点需要的 key 集合。
 

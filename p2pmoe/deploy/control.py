@@ -540,7 +540,9 @@ def build_model_setup(args, tasks_lam: Sequence[tuple[str, float]]) -> ModelSetu
 
 # --------------------------------------------------------------------------- #
 def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None,
-                         real_units: bool = False) -> list[Node]:
+                         real_units: bool = False,
+    out_caps: dict | None = None,
+) -> list[Node]:
     """步骤 1：问每个 agent「你有多少内存、算力多快」。
 
     算力用 agent 自己跑的 matmul 基准，归一化成相对值。比填铭牌值好，因为它
@@ -595,6 +597,11 @@ def collect_capabilities(addrs: dict[str, Addr], *, mem_cap_mb: float | None,
         log.error("=" * 68)
         raise SystemExit("没有任何 agent 可用")
 
+    # 原始应答带出去 —— 里面有 cuda 状态这类**只有节点自己知道**的东西，
+    # 而调用方要在配置之前用它做判断。
+    if out_caps is not None:
+        out_caps.update(caps)
+
     fastest = min(c["ms_per_layer"] for c in caps.values())
     nodes: list[Node] = []
     for name, c in caps.items():
@@ -628,12 +635,41 @@ def distribute(
     profile: bool = False,
     miss_policy: str = "drop",
     node_caps: "list | None" = None,
+    caps_raw: dict | None = None,
 ) -> list[dict]:
     """步骤 4：把清单拆开，每个节点只收自己那份。
 
     节点拿到的是「层区间 + 每层的专家 id 列表」——它不知道组合矩阵、不知道配额、
     不知道公共带。那些是离线规划的产物，在线用不到。
     """
+    # 要用 GPU 的话，先确认每台真的有可用的 GPU。
+    # 不查的话，CUDA 起不来的那台会挂在装载里，控制机等满超时才发现 ——
+    # 而节点日志里只有一行淹没在正常输出里的 UserWarning。
+    if device and device.startswith("cuda") and caps_raw:
+        bad = [(n, c["cuda"].get("why", "?"))
+               for n, c in caps_raw.items()
+               if isinstance(c.get("cuda"), dict) and not c["cuda"].get("ok")]
+        if bad:
+            log.error("")
+            log.error("=" * 68)
+            log.error("要 --device %s，但这些节点的 CUDA 用不了：", device)
+            for n, why in bad:
+                log.error("    %-6s %s", n, why)
+            log.error("")
+            log.error("硬上的结果是装载挂住，控制机等满超时 —— 而节点日志里只有")
+            log.error("一行 `CUDA unknown error` 的 UserWarning，淹在正常输出里。")
+            log.error("")
+            log.error("  · `CUDA unknown error` 常见于**驱动反复加载卸载** ——")
+            log.error("    没开持久化模式时，GPU 空闲就掉驱动。开一下：")
+            log.error("        sudo nvidia-smi -pm 1        # 或 sudo nvidia-persistenced")
+            log.error("    先在那台上确认：nvidia-smi 能不能正常出表")
+            log.error("  · 也可能是别的进程独占了 GPU：nvidia-smi 看有没有别人在跑")
+            log.error("  · **想先拿到一份端到端结果**，就走 CPU：")
+            log.error("        DEVICE=cpu bash ./deploy_15.sh measure")
+            log.error("    慢很多，但链路、识别、派发、时序全都验得到。")
+            log.error("=" * 68)
+            raise SystemExit("CUDA 不可用")
+
     by_seg: dict[str, list] = {}
     for p in manifest.nodes:
         by_seg.setdefault(p.segment, []).append(p)
@@ -919,8 +955,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------------- 1. 采集能力 ---------------------------------------- #
     log.info("[1/5] 采集节点能力（%d 台）", len(addrs))
+    raw_caps: dict = {}
     nodes = collect_capabilities(addrs, mem_cap_mb=args.mem_cap_mb,
-                                 real_units=setup.backend == "torch")
+                                 real_units=setup.backend == "torch", out_caps=raw_caps)
     if setup.backend == "torch":
         log.info("      可用内存/台 %s（已扣预留）",
                  sorted({f"{n.usable_gb:.1f}GB" for n in nodes}))
@@ -1149,7 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
     distribute(man, addrs, setup, clf, coord_addr, l0, wired or None,
                stop_ids=sorted(textio.stop.ids) if textio else None,
                model_dir=args.model_dir, device=args.device,
-               miss_policy=args.miss_policy, node_caps=nodes)
+               miss_policy=args.miss_policy, node_caps=nodes,
+               caps_raw=raw_caps)
 
     pool = PeerPool("__coord__", LinkTable(), seed=0)
     pool.use_relay(RELAY)
