@@ -733,10 +733,21 @@ def keys_for_node(manifest: DeploymentManifest, node: str, *,
     if p is None:
         raise SystemExit(
             f"清单里没有节点 {node}；有的是 {sorted(x.node for x in manifest.nodes)}")
+    # **role 要按运行侧的口径归一化。**
+    #
+    # 清单里备胎前段的 role 是 `front-standby`，而 `distribute` 在构造
+    # NodeConfig 时把它归一成 `front`（对的：备胎也是前段，接上流量就要
+    # 从 token id 查嵌入表）。这里若用原始 role，`front-standby` 的段首
+    # 就不会被算进 `with_embed` —— 于是 fetch 不拉 embed_tokens，
+    # 而 configure 时的加载偏偏要它，报
+    # `checkpoint 缺 1 个 key，首个: model.embed_tokens.weight`。
+    #
+    # 两边差一个字符串比较，代价是 141GB 下完之后才在装载那一刻暴露。
+    role = "front" if p.role.startswith("front") else p.role
     plan = KeyPlan(
         layer_experts={l.layer: list(l.experts) for l in p.layers},
-        with_embed=(p.role == "front" and p.is_head),
-        with_lm_head=(p.role.startswith("back:") and p.is_tail),
+        with_embed=(role == "front" and p.is_head),
+        with_lm_head=(role.startswith("back:") and p.is_tail),
     )
     cfg = config or {}
     if tie_word_embeddings is None:

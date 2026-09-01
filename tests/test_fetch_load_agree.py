@@ -27,12 +27,17 @@ from p2pmoe.sim.fake_checkpoint import TINY_QWEN3_MOE, TINY_QWEN3_NEXT
 
 
 def _load_side_keys(cfg: dict, man: DeploymentManifest, node: str) -> set[str]:
-    """复刻 `NodeServer._build_torch` 的分派 —— 加载侧真正会要的那套 key。"""
+    """复刻**运行侧**真正会要的那套 key。
+
+    照抄 `distribute()` 里构造 NodeConfig 的那几行 —— 包括那个容易漏的
+    归一化：`front-standby` 也是 `front`。
+    """
     p = man.plan_for(node)
+    role = "front" if p.role.startswith("front") else p.role
     plan = KeyPlan(
         layer_experts={l.layer: list(l.experts) for l in p.layers},
-        with_embed=(p.role == "front" and p.is_head),
-        with_lm_head=(p.role.startswith("back:") and p.is_tail),
+        with_embed=(role == "front" and p.is_head),
+        with_lm_head=(role.startswith("back:") and p.is_tail),
     )
     arch = str(cfg.get("model_type", "")).lower()
     archs = [str(a).lower() for a in cfg.get("architectures", [])]
@@ -53,10 +58,17 @@ def _manifest(n_layers: int, n_experts: int) -> DeploymentManifest:
     return DeploymentManifest.from_dict({
         "l0": l0, "model": {}, "segments": {
             "F0": {"role": "front", "task": None, "nodes": ["nf"]},
+            # 备胎前段：role 是 front-standby，而运行侧会把它归一成 front。
+            # 少了这一条，两侧对 with_embed 的分歧就测不出来 —— 真漏过一次。
+            "FS": {"role": "front-standby", "task": None, "nodes": ["ns"]},
             "B0": {"role": "back:u", "task": "u", "nodes": ["nb"]},
         },
         "nodes": [
             {"node": "nf", "role": "front", "segment": "F0", "position": 0,
+             "is_head": True, "is_tail": True, "layer_range": [1, l0],
+             "weight_gb": 1.0, "kv_gb": 0.0, "total_gb": 1.0,
+             "layers": layers(1, l0)},
+            {"node": "ns", "role": "front-standby", "segment": "FS", "position": 0,
              "is_head": True, "is_tail": True, "layer_range": [1, l0],
              "weight_gb": 1.0, "kv_gb": 0.0, "total_gb": 1.0,
              "layers": layers(1, l0)},
@@ -75,7 +87,7 @@ CASES = [
 
 
 @pytest.mark.parametrize("cfg", CASES)
-@pytest.mark.parametrize("node", ["nf", "nb"])
+@pytest.mark.parametrize("node", ["nf", "ns", "nb"])
 def test_the_two_sides_ask_for_exactly_the_same_keys(cfg, node) -> None:
     man = _manifest(cfg["num_hidden_layers"], cfg["num_experts"])
     want = _load_side_keys(cfg, man, node)
@@ -129,3 +141,29 @@ def test_no_config_falls_back_to_moe() -> None:
     cfg = dict(TINY_QWEN3_MOE)
     man = _manifest(cfg["num_hidden_layers"], cfg["num_experts"])
     assert keys_for_node(man, "nf", config=None)
+
+
+def test_a_standby_front_head_still_needs_the_embedding(  ) -> None:
+    """**真踩过。**
+
+    清单里备胎前段的 role 是 `front-standby`，而运行侧把它归一成 `front`
+    （对的：备胎接上流量一样要从 token id 查嵌入表）。fetch 侧若用原始
+    role 比较，这台就不会拉 `model.embed_tokens.weight` ——
+    而 141GB 下完、verify 也过了之后，才在 configure 装载那一刻报
+    `checkpoint 缺 1 个 key`。
+
+    两边差的就是一个 `startswith`。
+    """
+    cfg = dict(TINY_QWEN3_NEXT)
+    man = _manifest(cfg["num_hidden_layers"], cfg["num_experts"])
+    keys = keys_for_node(man, "ns", config=cfg)
+    assert "model.embed_tokens.weight" in keys
+
+
+def test_the_two_sides_normalise_role_the_same_way() -> None:
+    """归一化是两处各写一遍的 —— 那正是它们会分家的原因。"""
+    root = Path(__file__).resolve().parent.parent
+    norm = '"front" if p.role.startswith("front") else p.role'
+    for f in ("p2pmoe/deploy/fetch.py", "p2pmoe/deploy/control.py"):
+        src = (root / f).read_text(encoding="utf-8")
+        assert norm in src, f"{f} 没有按运行侧口径归一化 role"
