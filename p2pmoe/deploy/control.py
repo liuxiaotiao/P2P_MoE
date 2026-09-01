@@ -103,6 +103,21 @@ RELAY: Addr | None = None
 参数，不如认一个事实：一次部署要么全走中继，要么全不走，没有一半一半。"""
 
 
+def _still_listening(addr: Addr, timeout: float = 3.0) -> bool:
+    """端口还有人听吗。
+
+    用来把「装得慢」和「进程死了」分开 —— 两者都表现为 RPC 超时，
+    但一个是等，一个是查 OOM。
+    """
+    import socket as _s
+
+    try:
+        with _s.create_connection(addr, timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _rpc(node: str, addr: Addr, header: dict, *, timeout: float = 30.0) -> dict:
     return rpc(addr, header, timeout=timeout, relay=RELAY, to=node)
 
@@ -586,6 +601,7 @@ def distribute(
     device: str = "cpu",
     profile: bool = False,
     miss_policy: str = "drop",
+    node_caps: "list | None" = None,
 ) -> list[dict]:
     """步骤 4：把清单拆开，每个节点只收自己那份。
 
@@ -600,6 +616,41 @@ def distribute(
 
     peers = {n: list(a) for n, a in addrs.items()}
     wiring = dict(static_wiring or {})
+    # 装载之前先算一遍内存账。
+    #
+    # 不算的话，装不下的那台会在 configure 里被 OOM killer 干掉，而调用方
+    # 看到的是一个裸 TimeoutError —— 那时已经花了几分钟，而且完全看不出
+    # 是内存问题。这里几毫秒就能回答。
+    #
+    # **同一台物理机上挤了多个节点 id 时，它们的驻留量是相加的** ——
+    # 按上报的内存分组能抓到一部分（同机的 mem_mb 会非常接近），但真正
+    # 可靠的判据是 ./deploy_15.sh identity。
+    if node_caps:
+        mem = {n.id: float(n.mem_gb) for n in node_caps}
+        tight: list[str] = []
+        for p_ in manifest.nodes:
+            have = mem.get(p_.node)
+            if not have:
+                continue
+            need = float(getattr(p_, "total_gb", 0) or 0)
+            if need and need > have * 0.92:
+                tight.append(f"{p_.node}: 要装 {need:.1f}GB，可用 {have:.1f}GB")
+        if tight:
+            log.error("")
+            log.error("=" * 68)
+            log.error("这些节点装不下自己那一份：")
+            for t in tight:
+                log.error("    %s", t)
+            log.error("")
+            log.error("硬装的结果是 OOM killer 把 agent 干掉，而调用方只会看到")
+            log.error("一个 configure 超时 —— 花几分钟，还看不出是内存问题。")
+            log.error("")
+            log.error("  · 降覆盖率让后段驻留集更小：--coverage 0.5")
+            log.error("  · 或者确认是不是**几个节点 id 挤在同一台物理机上** ——")
+            log.error("    那样它们的驻留量相加：bash ./deploy_15.sh identity")
+            log.error("=" * 68)
+            raise SystemExit("内存装不下")
+
     acks: list[dict] = []
     for p in manifest.nodes:
         chain = by_seg[p.segment]
@@ -647,8 +698,47 @@ def distribute(
             profile=profile and role.startswith("back:"),
             miss_policy=miss_policy,
         )
-        ack = _rpc(p.node, addrs[p.node], {"type": "configure", "config": cfg.to_dict()},
-                   timeout=120.0)
+        # 超时按这台要装的量放大：120 秒对 1GB 绰绰有余，对 22GB 冷盘可能不够，
+        # 而「不够」的表现是一个裸 TimeoutError，读不出是慢还是死。
+        gb = float(getattr(p, "total_gb", 0) or getattr(p, "weight_gb", 0) or 1.0)
+        budget = max(120.0, 60.0 + gb * 30.0)     # 22GB → 720s
+        try:
+            ack = _rpc(p.node, addrs[p.node],
+                       {"type": "configure", "config": cfg.to_dict()},
+                       timeout=budget)
+        except (TimeoutError, OSError) as e:
+            # 裸异常只说「timed out」，不说是谁、在装什么、还活着没有 ——
+            # 而那三件事决定了下一步往哪查。
+            alive = _still_listening(addrs[p.node])
+            log.error("")
+            log.error("=" * 68)
+            log.error("配置 %s 超时（等了 %.0fs）：%s", p.node, budget, e)
+            log.error("  它要装 层 %s，%.1fGB",
+                      f"{p.layer_range[0]}–{p.layer_range[1]}" if p.layer_range else "?",
+                      gb)
+            log.error("  上一台成功的是 %s —— 说明链路本身是通的。",
+                      acks[-1]["node"] if acks else "（这是第一台）")
+            if alive:
+                log.error("")
+                log.error("  端口还在听 —— 进程活着，只是**还没装完**。")
+                log.error("  盘慢或页缓存冷的话 %.1fGB 可能真要更久：", gb)
+                log.error("      在 %s 上看：tail -f /tmp/p2pmoe/agent-%s.log",
+                          addrs[p.node][0], p.node)
+                log.error("      加大预算重跑：CONFIGURE_GB_SEC=60 bash ./deploy_15.sh measure")
+            else:
+                log.error("")
+                log.error("  **端口已经不听了 —— 进程死了。**")
+                log.error("  装 %.1fGB 的时候被杀掉，最可能是 OOM：", gb)
+                log.error("      在 %s 上看：dmesg -T | tail -20 | grep -i oom",
+                          addrs[p.node][0])
+                log.error("      也看：tail -30 /tmp/p2pmoe/agent-%s.log", p.node)
+                log.error("  这台内存装不下自己那一份的话，只有两条路：")
+                log.error("    · 降 COVERAGE，让后段的驻留集更小")
+                log.error("    · 换一台内存更大的，或把这个 id 挪到别的机器")
+                log.error("  注意：**几个节点 id 挤在同一台物理机上**时，")
+                log.error("  它们的驻留量是相加的 —— bash ./deploy_15.sh identity 查这个。")
+            log.error("=" * 68)
+            raise SystemExit(f"配置 {p.node} 失败")
         acks.append(ack)
         rng = ack["layers"]
         span = f"{rng[0]}–{rng[-1]}" if len(rng) > 1 else str(rng[0])
@@ -1002,7 +1092,7 @@ def main(argv: list[str] | None = None) -> int:
     distribute(man, addrs, setup, clf, coord_addr, l0, wired or None,
                stop_ids=sorted(textio.stop.ids) if textio else None,
                model_dir=args.model_dir, device=args.device,
-               miss_policy=args.miss_policy)
+               miss_policy=args.miss_policy, node_caps=nodes)
 
     pool = PeerPool("__coord__", LinkTable(), seed=0)
     pool.use_relay(RELAY)
