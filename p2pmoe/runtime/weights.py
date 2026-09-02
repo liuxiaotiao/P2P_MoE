@@ -60,6 +60,24 @@ def cuda_state() -> dict:
     return {"ok": True, "n": n, "name": torch.cuda.get_device_name(0)}
 
 
+def release_cuda_cache() -> None:
+    """把缓存分配器手里的空闲块还给驱动。
+
+    调用方（`NodeServer._release_model`）刚刚丢掉了上一份模型的引用。那些显存
+    已经回到 PyTorch 的缓存池里，本进程能重用 —— 但只在**块的形状对得上**时。
+    重新配置往往换了层数和专家数，块的大小全变，于是池子里躺着一堆用不上的
+    空闲块，而新的分配还要向驱动要。`empty_cache()` 把它们退回去。
+
+    住在这里而不是 `node.py` 里，理由和 `cuda_state()` 一样：
+    `test_heavy_deps_stay_in_the_execution_layer` 盯着 —— 控制面那一层
+    （node.py 也在其中）一个 torch 都不许 import。
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def qwen_moe_keys(plan: KeyPlan, *, tie_word_embeddings: bool = False) -> set[str]:
     """Qwen3-MoE 的 key 命名 → 本节点需要的 key 集合。
 

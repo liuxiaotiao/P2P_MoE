@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import queue
 import socket
@@ -256,12 +257,41 @@ class NodeServer:
             self.host, self.port = self.sock.getsockname()[:2]
 
     # -- 第二阶段：装载 ---------------------------------------------------- #
+    def _release_model(self) -> None:
+        """装新的之前，先把上一份放掉。
+
+        **顺序是这里唯一要紧的事。** 原来的写法是先 `SelectiveLoader.load()` 把
+        新张量全部分配出来，最后才 `self.model = SegModel(...)` —— 也就是说整个
+        装载过程中旧模型一直挂在 `self` 上，显存峰值是**两份**。
+
+        一份 14.6GB 的前段配在 22GB 的卡上绰绰有余，两份就必然炸。实测正是如此：
+        第二次 configure 报 OOM，且「保留但未用」只有 1.58MiB —— 不是碎片，是旧
+        张量真的还被引用着。后果是同一批 agent 只能被 configure 一次，而 `measure`
+        每跑一遍都要重新下发清单，于是每次实验前都得重启 15 个进程。
+
+        `gc.collect()` 不能省：模型是模块套模块，父子互指成环，光靠引用计数放不掉。
+        环要等下一次 gc 才收，而下一次 gc 很可能发生在新张量已经分配之后 —— 那就
+        白让了。
+        """
+        if self.model is None:
+            return
+        device = str(getattr(self.cfg, "device", "") or "") if self.cfg else ""
+        self.model = None
+        gc.collect()
+        if device.startswith("cuda"):
+            # 缓存分配器手里的空闲块本进程能重用，但形状对不上时仍会碎。
+            # 还给驱动一次，代价是下一次分配要重新问驱动要，几十毫秒。
+            from .weights import release_cuda_cache
+
+            release_cuda_cache()
+
     def apply_config(self, cfg: NodeConfig) -> dict:
         """收到清单：加载**属于自己那一段的那几层的那些专家**。
 
         两个后端共用这一条路径，因为它们的契约相同
         （`forward(req, x) -> (y, MoEStats)`、`drop_kv` 等）。
         """
+        self._release_model()   # 先放旧的，再装新的 —— 见上面的注释
         self.cfg = cfg
         t0 = time.perf_counter()
         extra: dict = {}

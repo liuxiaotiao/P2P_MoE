@@ -1125,11 +1125,9 @@ def main(argv: list[str] | None = None) -> int:
             log.info("      连接已存 %s（改完可用 --wiring 喂回来）", args.save_wiring)
 
     # ---------------- 4. 下发清单 ---------------------------------------- #
-    host = args.advertise
-    if host is None:
-        host = "127.0.0.1" if all(a[0] in ("127.0.0.1", "localhost") for a in addrs.values()) \
-            else _guess_local_ip(next(iter(addrs.values())))
-        log.info("      未指定 --advertise，推断控制器地址为 %s", host)
+    host, guessed = coordinator_host(args.advertise, addrs)
+    if guessed:
+        log.info("      未给 --advertise，推断控制器地址为 %s", host)
 
     clf = None
     if not args.static:
@@ -1432,6 +1430,29 @@ def main(argv: list[str] | None = None) -> int:
     coord.stop()
     pool.close()
     return 1 if coord.errors else 0
+
+
+def coordinator_host(advertise: str | None, addrs: dict) -> tuple[str, bool]:
+    """协调器要告诉 15 台节点「回报打到哪儿」。返回 (地址, 是不是推断出来的)。
+
+    **空串必须和缺省同等对待。** 原来的判断是 `if advertise is None`，而
+    `deploy_15.sh` 在 ADVERTISE 没设时会原样传 `--advertise ""` —— 空串不是
+    None，于是推断分支被跳过，`host` 就是空串，然后被下发给全部 15 台节点，
+    它们各自 `pool.register("__coord__", ("", port))`。
+
+    那之后的表现是这套系统里最难查的一种：控制机 → 节点方向全通（configure
+    成功、权重装好、`check` 全绿），节点算完往空地址回报时 `OSError` 被
+    `_serve_conn` 的 `except (ConnectionError, OSError): pass` 静静吃掉，连接
+    一关，线程退出。协调器永远等不到识别事件，请求超时，而现场看起来是
+    「节点空闲、GPU 0%、零连接」—— 像是从没收到过活。
+
+    实测代价是四个小时。空串在这里没有任何合法含义，一律当没给。
+    """
+    if advertise:
+        return advertise, False
+    if all(a[0] in ("127.0.0.1", "localhost") for a in addrs.values()):
+        return "127.0.0.1", True
+    return _guess_local_ip(next(iter(addrs.values()))), True
 
 
 def _guess_local_ip(peer: Addr) -> str:

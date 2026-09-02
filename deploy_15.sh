@@ -260,10 +260,22 @@ cmd_sync() {
   echo "  （没 ssh：手工 rsync 到各机 $WORKDIR，再各自 pip install -r requirements-node.txt）"
 }
 
+# 节点建链时要回连控制机，得知道往哪连。守卫必须在**每个会下发清单的子命令**里，
+# 不能只在 check 里 —— 那正好是唯一不靠它的那个。serve 裸奔的代价见
+# control.py 的 coordinator_host()。
+_require_advertise() {
+  [ -n "$ADVERTISE" ] || {
+    echo "✗ 必须设 ADVERTISE=<控制机对节点可见的IP>"
+    echo "  节点算完之后要往这个地址回报；空着的话请求会静默超时，"
+    echo "  而现场看起来像「节点没收到活」。"
+    exit 1
+  }
+}
+
 cmd_check() {
   say "0. 前置检查"
   need "$HOSTS"; need "$PLAN"; need "$PROFILE"
-  [ -n "$ADVERTISE" ] || { echo "✗ 必须设 ADVERTISE=<控制机对节点可见的IP>"; exit 1; }
+  _require_advertise
   $PY -c "import numpy, tokenizers, jinja2" 2>/dev/null \
     || { echo "✗ 控制机缺依赖：pip3 install -r requirements-control.txt"; exit 1; }
   echo "  控制机依赖 ✓（只要 numpy+tokenizers+jinja2，**不装 torch**）"
@@ -475,6 +487,7 @@ PYEOF
 
 cmd_serve() {
   say "5. 建链 + 服务（动态：盲绑 → 识别 → 派发）"
+  _require_advertise
   _require_agents || return 1
   $PY -m p2pmoe.deploy.control \
       --agents "$(AGENTS)" --advertise "$ADVERTISE" \
