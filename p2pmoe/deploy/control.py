@@ -1159,9 +1159,13 @@ def main(argv: list[str] | None = None) -> int:
         baselines = {u: p_.baseline_miss(l0 + 1, setup.n_layers)
                      for u, p_ in plcs.items()}
         how = "按 1−覆盖率 估计，偏低，仅供参考"
+    measured = setup.backend == "numpy"
     log.info("      通道二基线（%s）: %s%s", how,
              {u: f"{v:.1%}" for u, v in baselines.items()},
              "（静态模式下只统计，不触发换绑）" if args.static else "")
+    if not measured and not args.static:
+        log.info("      估计值不做告警线 —— 先在线自校准（拿没换过绑的请求实测），"
+                 "攒够 %d 条再启用换绑", 6)
 
     # ---- 文本层：只在控制机上 ---- #
     textio = None
@@ -1177,7 +1181,8 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("      给了 --prompt 但没有 --model-dir，tokenizer 无从加载 —— 忽略")
 
     coord = Coordinator(man, baselines=baselines, priors=dict(tasks_lam),
-                        alarm_factor=3.0, host=args.bind, static_wiring=wired or None,
+                        alarm_factor=3.0, baselines_measured=measured,
+                        host=args.bind, static_wiring=wired or None,
                         textio=textio, relay=RELAY)
     coord_addr = (host, coord.port)
     log.info("[4/5] 下发清单（协调器 %s:%d）", *coord_addr)

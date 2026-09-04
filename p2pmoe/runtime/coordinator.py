@@ -118,6 +118,8 @@ class Coordinator:
         priors: Mapping[str, float],
         alarm_factor: float = 5.0,
         min_window: int = 6,
+        baselines_measured: bool = True,
+        calibrate_n: int = 6,
         host: str = "127.0.0.1",
         port: int = 0,
         static_wiring: Mapping[str, tuple[str, str]] | None = None,
@@ -140,6 +142,28 @@ class Coordinator:
         self.priors = dict(priors)
         self.alarm_factor = alarm_factor
         self.min_window = min_window
+
+        # ---- 通道二的告警线：来源比数值更要紧 -------------------------- #
+        # toy 模型能拿同一份语料回放，基线是**实测**的，可以直接当告警线。
+        # 真模型没有可回放的语料，`baselines` 是「1 − 覆盖率」估出来的，而它
+        # **偏低 3–6 倍**（control.py 里那段注释早就写着）。用它当告警线的
+        # 后果实测过一次：
+        #
+        #     告警线 = 0.30 × 3.0 = 0.90，而真实 miss 率 ≈ 0.9–1.8
+        #     → 告警线正好落在正常工作区间的**中间**，成了一枚硬币
+        #     → 20 条请求里 15 条被误报换绑，而**换绑一次必然换错**（只有两个
+        #       task）。在线识别本来是 20/20，被通道二打成 5/20。
+        #
+        # 一个偏差已知、方向已知的估计值，不该驱动一个不可逆的动作。所以：
+        # 估计出来的基线**不报警**，改为在线自校准 —— 拿"没换过绑因而多半绑
+        # 对了"的请求实测 miss 率，攒够 `calibrate_n` 条再启用。
+        #
+        # 宁可漏报也不能乱报：漏报只是维持分类器的判断（这里 100% 正确），
+        # 乱报却会主动把一个对的绑定改成错的。
+        self.baselines_measured = baselines_measured
+        self.calibrate_n = calibrate_n
+        self._miss_seen: dict[str, list[float]] = {}
+        self._alarm_announced: set[str] = set()
 
         # 空闲队列：盲绑就是从这里 pop
         self.free_fronts: deque[str] = deque(
@@ -575,8 +599,9 @@ class Coordinator:
         # ---- 通道二：滑窗 miss 率 vs 基线（II.5） ----
         # 静态模式下 task 是给定的，不存在误绑 —— 仍然统计 miss 率（它反映
         # 驻留集覆盖得够不够），但不触发换绑。
-        base = self.baselines.get(rec.task, 0.03)
+        base = self.alarm_baseline(rec.task)
         if (not self.static
+                and base is not None
                 and len(rec.miss_window) >= self.min_window
                 and rec.window_miss > base * self.alarm_factor
                 and rec.rebinds < 2):
@@ -590,6 +615,37 @@ class Coordinator:
         if len(rec.tokens) >= self.max_tokens:
             rec.stop_reason = "max_tokens"
             self._finish(rec)
+
+    def alarm_baseline(self, task: str) -> float | None:
+        """通道二的告警线。`None` 表示**还不能报警**。
+
+        实测基线直接用。估计基线一律不用 —— 见 `__init__` 里那段。改为拿运行
+        中没换过绑的请求实测：它们多半是绑对的，它们的 miss 率就是「绑对时应该
+        长什么样」。取中位数而不是均值，免得一条离群请求把线拉走。
+        """
+        if self.baselines_measured:
+            return self.baselines.get(task, 0.03)
+        seen = self._miss_seen.get(task, ())
+        if len(seen) < self.calibrate_n:
+            return None
+        return float(np.median(np.asarray(seen)))
+
+    def _note_baseline_sample(self, rec: RequestRecord) -> None:
+        """一条请求跑完了，如果它没换过绑，就把它的 miss 率记进校准样本。
+
+        「没换过绑」是我们能拿到的、最接近「绑对了」的信号 —— 真实 task 只有
+        评分时才知道，运行期不许看（看了就是作弊）。
+        """
+        if self.baselines_measured or not rec.task or rec.rebinds:
+            return
+        if len(rec.miss_window) < self.min_window:
+            return
+        seen = self._miss_seen.setdefault(rec.task, [])
+        seen.append(rec.window_miss)
+        if len(seen) == self.calibrate_n and rec.task not in self._alarm_announced:
+            self._alarm_announced.add(rec.task)
+            rec.log(f"通道二已自校准（{rec.task}）：基线 "
+                    f"{self.alarm_baseline(rec.task):.1%}，从此开始报警")
 
     def _rebind(self, rec: RequestRecord) -> None:
         """换绑：按前段分类器的次优 task 重绑（通道一与通道二合流）。"""
@@ -642,6 +698,7 @@ class Coordinator:
                 rec.text += tail
                 if self.on_text:
                     self.on_text(rec, tail)
+        self._note_baseline_sample(rec)
         rec.log(f"完成 {len(rec.tokens)} 个 token，释放前后段")
         for sid in (rec.front, rec.back):
             for n in self.seg_nodes.get(sid, []):
